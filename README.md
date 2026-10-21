@@ -402,6 +402,7 @@ Useful options:
 --nick NAME             display name (defaults to callsign)
 --channel #NAME         initial channel (last selected, or #general on first run)
 --mode MODE             optional Data2G broadcast transmit mode
+--unattended            use a Data2G mode at or below 500 Hz for automatic traffic; explicit sends may use --mode or the widest host mode
 --transport TRANSPORT   broadcast (default), connected, or ax25
 --bandwidth HZ          connected ARQ cap: 500, 1200, 2300, or 2750
 --auto-sync             periodically exchange history (default; transmits on air)
@@ -413,6 +414,17 @@ Useful options:
 --digipeaters PATH      comma-separated AX.25 digipeater path
 --db PATH               SQLite database path
 ```
+
+`--unattended` is for unattended Data2G broadcast relays. Startup reads the
+host's `MODES` catalog and fails closed if it cannot find a mode at or below
+500 Hz. Sync, relay, and other automatic traffic use that narrow mode. A
+message you explicitly send (and its attachment metadata) temporarily uses
+`--mode` when supplied, or the widest advertised mode, then switches back after
+the modem acknowledges the frame. This option is currently limited to Data2G
+broadcast; it does not change connected ARQ or raw AX.25 TNC configuration.
+The same policy can be switched live with the **Unattended · auto TX ≤500 Hz**
+checkbox in the TUI. Its setting is saved with the local chat database. When
+unchecked, automatic traffic returns to the selected operator mode.
 
 ## Commands
 

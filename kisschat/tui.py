@@ -24,7 +24,8 @@ from textual import events
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
-from textual.widgets import Button, Footer, Input, Label, OptionList, RichLog, Static
+from textual.widgets import (Button, Checkbox, Footer, Input, Label, OptionList,
+                             RichLog, Static)
 from textual.widgets.option_list import Option
 
 from .app import Chat
@@ -480,6 +481,10 @@ class ChatApp(App[None]):
                 yield Static("● CONNECTING", id="link-state")
                 detail = self._link_detail()
                 yield Static(detail, id="link-detail")
+                yield Checkbox("Unattended · auto TX ≤500 Hz",
+                               value=self.chat.unattended,
+                               disabled=getattr(self.chat.args, "transport", "broadcast") != "broadcast",
+                               id="unattended-toggle")
                 yield Static("YOUR STATION", classes="eyebrow section-label")
                 yield Static(f"{self.chat.nick}\n{self.chat.args.callsign}", id="station-card")
                 yield Static("HEARD STATIONS", classes="eyebrow section-label")
@@ -559,6 +564,24 @@ class ChatApp(App[None]):
         elif event.button.id == "load-older":
             self.history_limit += 200
             self._load_messages()
+
+    async def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id != "unattended-toggle":
+            return
+        checkbox = event.checkbox
+        if event.value == self.chat.unattended:
+            return
+        previous = self.chat.unattended
+        checkbox.disabled = True
+        try:
+            await asyncio.to_thread(self.chat.set_unattended, event.value)
+        except Exception as exc:
+            checkbox.value = previous
+            self.last_status = f"Could not change unattended policy: {exc}"
+            self.query_one("#activity", Static).update(self._short_status(self.last_status))
+        finally:
+            checkbox.disabled = (getattr(self.chat.args, "transport", "broadcast") != "broadcast" or
+                                 not self.chat.data.unattended_available)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         # Some terminal emulators deliver a file drop as ordinary input rather
@@ -1080,6 +1103,9 @@ class ChatApp(App[None]):
                 if (str(value).startswith("Connected to Data2G") or
                         str(value).startswith("Connected to raw KISS")):
                     self.query_one("#link-detail", Static).update(self._link_detail())
+                    if self.chat.args.transport == "broadcast":
+                        self.query_one("#unattended-toggle", Checkbox).disabled = (
+                            not self.chat.data.unattended_available)
                 status = str(value).lower()
                 link_state = self.query_one("#link-state", Static)
                 if self.chat.args.transport == "connected":

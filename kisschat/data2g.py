@@ -72,14 +72,18 @@ class Data2G:
                  ax25_destination: str = "CQ", digipeaters: tuple[str, ...] = (),
                  kiss_tnc_port: int = 0,
                  ax25_baud: int = 1200, ax25_interframe_delay: float = 0.25,
+                 unattended: bool = False,
                  on_frame=None, on_status=None, on_debug=None, on_frame_context=None):
         self.host, self.callsign = host, callsign.upper()
         if transport not in {"broadcast", "connected", "ax25"}:
             raise ValueError("transport must be broadcast, connected, or ax25")
+        if unattended and transport != "broadcast":
+            raise ValueError("--unattended currently requires Data2G broadcast transport")
         if bandwidth not in {"500", "1200", "2300", "2750"}:
             raise ValueError("bandwidth must be 500, 1200, 2300, or 2750")
         self.command_port, self.kiss_port, self.mode = command_port, kiss_port, mode
         self.transport = transport
+        self.unattended = unattended
         self.ax25_destination = ax25_destination.upper()
         self.digipeaters = tuple(hop.upper() for hop in digipeaters)
         self.kiss_tnc_port = kiss_tnc_port
@@ -101,13 +105,21 @@ class Data2G:
         self.on_debug = on_debug
         self.command_socket = self.kiss_socket = self.data_socket = None
         self.port = None
-        self.outbound: queue.Queue[bytes | None] = queue.Queue(maxsize=128)
-        self.bulk_outbound: queue.Queue[bytes] = queue.Queue(maxsize=384)
+        self.outbound: queue.Queue[tuple[bytes, bool] | None] = queue.Queue(maxsize=128)
+        self.bulk_outbound: queue.Queue[tuple[bytes, bool]] = queue.Queue(maxsize=384)
         self.stop_event = threading.Event()
         self.shutdown_event = threading.Event()
         self.connected_event = threading.Event()
         self.session_event = threading.Event()
         self.command_lock = threading.Lock()
+        self.live_command_lock = threading.Lock()
+        self.live_command_pending = threading.Event()
+        self.live_command_responses: queue.Queue[str] = queue.Queue()
+        self.auto_mode = self.manual_mode = ""
+        self.current_broadcast_mode = ""
+        self.mode_catalog: list[tuple[str, float]] = []
+        self.unattended_available = False
+        self.policy_requests: queue.Queue[tuple[bool, threading.Event, list[Exception]]] = queue.Queue()
         self.threads: list[threading.Thread] = []
         self.supervisor: threading.Thread | None = None
         self.tag = 0
@@ -174,6 +186,108 @@ class Data2G:
                 return lines
         raise TimeoutError(f"Timed out waiting for Data2G response to {command}")
 
+    def _command_modes(self, sock: socket.socket) -> list[tuple[str, float]]:
+        """Read Data2G's mode catalog before the command reader starts."""
+        with self.command_lock:
+            sock.sendall(b"MODES\r")
+        lines = []
+        deadline = time.monotonic() + 10
+        quiet_until = None
+        while time.monotonic() < deadline:
+            try:
+                line = self._line(sock, min(1.0, max(0.1, deadline - time.monotonic())))
+            except (TimeoutError, socket.timeout):
+                if lines and quiet_until is not None and time.monotonic() >= quiet_until:
+                    break
+                continue
+            if line == "WRONG":
+                raise RuntimeError("Data2G host refused MODES; cannot verify unattended bandwidth")
+            if line == "OK":
+                break
+            if line:
+                lines.append(line)
+                quiet_until = time.monotonic() + 0.3
+        modes = []
+        for line in lines:
+            fields = line.split()
+            if not fields or fields[0] != "MODE":
+                continue
+            if len(fields) != 7:
+                raise RuntimeError(f"malformed Data2G MODES response: {line!r}")
+            try:
+                modes.append((fields[1], float(fields[2])))
+            except ValueError as exc:
+                raise RuntimeError(f"malformed Data2G MODES response: {line!r}") from exc
+        if not modes:
+            raise RuntimeError("Data2G host returned no modes; cannot verify unattended bandwidth")
+        return modes
+
+    def _set_live_broadcast_mode(self, mode: str) -> None:
+        if not mode or self.transport != "broadcast":
+            return
+        with self.live_command_lock:
+            while True:
+                try:
+                    self.live_command_responses.get_nowait()
+                except queue.Empty:
+                    break
+            self.live_command_pending.set()
+            try:
+                with self.command_lock:
+                    self.command_socket.sendall(
+                        f"BCAST MODE {self.port} {mode}\r".encode("ascii"))
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    try:
+                        line = self.live_command_responses.get(
+                            timeout=max(0.1, deadline - time.monotonic()))
+                    except queue.Empty as exc:
+                        raise TimeoutError(f"timed out selecting Data2G mode {mode}") from exc
+                    if line == "WRONG":
+                        raise RuntimeError(f"Data2G host refused mode {mode}")
+                    if line == "OK":
+                        if self.on_debug:
+                            self.on_debug("BANDWIDTH_MODE", {"mode": mode})
+                        return
+            finally:
+                self.live_command_pending.clear()
+
+    def set_unattended(self, enabled: bool, timeout: float = 20.0) -> None:
+        """Switch policy in the TX worker so mode changes cannot race a frame."""
+        if self.transport != "broadcast":
+            raise RuntimeError("unattended bandwidth control requires Data2G broadcast")
+        if not self.connected_event.is_set():
+            raise ConnectionError("Data2G broadcast link is not connected")
+        if not self.unattended_available:
+            raise RuntimeError("Data2G host has no validated mode at or below 500 Hz")
+        done = threading.Event()
+        errors: list[Exception] = []
+        self.policy_requests.put((bool(enabled), done, errors))
+        if not done.wait(timeout):
+            raise TimeoutError("timed out changing unattended bandwidth policy")
+        if errors:
+            raise RuntimeError(str(errors[0])) from errors[0]
+
+    def _apply_policy_requests(self) -> None:
+        while True:
+            try:
+                enabled, done, errors = self.policy_requests.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                target = self.auto_mode if enabled else self.manual_mode
+                if target and target != self.current_broadcast_mode:
+                    self._set_live_broadcast_mode(target)
+                    self.current_broadcast_mode = target
+                self.unattended = enabled
+                if self.on_debug:
+                    self.on_debug("BANDWIDTH_POLICY_CHANGED", {
+                        "unattended": enabled, "mode": target})
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
     def start(self) -> None:
         """Start a reconnecting connection manager and return immediately."""
         if self.supervisor and self.supervisor.is_alive():
@@ -196,10 +310,70 @@ class Data2G:
             self.command_socket = socket.create_connection((self.host, self.command_port), timeout=5)
             self._command(self.command_socket, "VERSION", "VERSION Data2G ")
         if self.transport == "broadcast":
+            try:
+                modes = self._command_modes(self.command_socket)
+            except (RuntimeError, TimeoutError, OSError):
+                if self.unattended:
+                    raise RuntimeError("cannot read Data2G MODES catalog for unattended operation")
+                modes = []
+            self.mode_catalog = modes
+            narrow = [mode for mode in modes if mode[1] <= 500]
+            self.unattended_available = bool(narrow)
+            if self.unattended and not narrow:
+                raise RuntimeError("unattended mode requires a Data2G broadcast mode at or below 500 Hz")
+            configured = self.mode
+            if configured and modes and configured not in {mode[0] for mode in modes}:
+                raise RuntimeError(f"Data2G mode {configured!r} is not in the host MODES catalog")
             response = self._command(self.command_socket, f"BCAST OPEN CHAT FROM {call}", "BCAST PORT ")
             self.port = int(next(line.split()[2] for line in response if line.startswith("BCAST PORT ")))
-            if self.mode:
-                self._command(self.command_socket, f"BCAST MODE {self.port} {self.mode}", "OK")
+            if modes:
+                for candidate, _width in sorted(narrow, key=lambda mode: mode[1]):
+                    try:
+                        self._command(self.command_socket,
+                                      f"BCAST MODE {self.port} {candidate}", "OK")
+                    except RuntimeError:
+                        continue
+                    self.auto_mode = candidate
+                    break
+                self.unattended_available = bool(self.auto_mode)
+                if self.unattended and not self.unattended_available:
+                    raise RuntimeError("Data2G refused every broadcast mode at or below 500 Hz")
+                manual_candidates = ([next(mode for mode in modes if mode[0] == configured)]
+                                     if configured else sorted(modes, key=lambda mode: mode[1], reverse=True))
+                for candidate, _width in manual_candidates:
+                    try:
+                        self._command(self.command_socket,
+                                      f"BCAST MODE {self.port} {candidate}", "OK")
+                    except RuntimeError:
+                        if configured:
+                            raise
+                        continue
+                    self.manual_mode = candidate
+                    break
+                if not self.manual_mode:
+                    if self.auto_mode:
+                        self.manual_mode = self.auto_mode
+                    if self.unattended or configured:
+                        if not self.manual_mode:
+                            raise RuntimeError("Data2G refused every advertised operator-send mode")
+                selected_mode = self.auto_mode if self.unattended else self.manual_mode
+                if selected_mode:
+                    self._command(self.command_socket,
+                                  f"BCAST MODE {self.port} {selected_mode}", "OK")
+            else:
+                selected_mode = self.mode
+                self.manual_mode = self.mode
+                if selected_mode:
+                    self._command(self.command_socket, f"BCAST MODE {self.port} {selected_mode}", "OK")
+            if selected_mode:
+                self.current_broadcast_mode = selected_mode
+            if modes and self.on_debug:
+                self.on_debug("BANDWIDTH_POLICY", {
+                    "automatic_mode": self.auto_mode,
+                    "automatic_hz": next((width for name, width in modes
+                                           if name == self.auto_mode), None),
+                    "operator_mode": self.manual_mode,
+                })
             self.kiss_socket = socket.create_connection((self.host, self.kiss_port), timeout=5)
         elif self.transport == "connected":
             self._command(self.command_socket, f"MYCALL {call}", "OK")
@@ -236,6 +410,9 @@ class Data2G:
                  else "VARA-compatible ARQ ready; listening for connected peers")
         self._status(f"Connected to Data2G at {self.host}; {label}" if self.transport != "ax25"
                      else f"Connected to raw KISS TNC at {self.host}:{self.kiss_port}; {label}")
+        if self.unattended:
+            self._status(f"Unattended bandwidth policy: automatic={self.auto_mode}; "
+                         f"operator sends={self.manual_mode}")
 
     def _transport_label(self) -> str:
         return "KISS" if self.transport == "ax25" else "Data2G"
@@ -290,19 +467,23 @@ class Data2G:
                     pass
         self.data_socket = self.kiss_socket = self.command_socket = None
 
-    def send(self, payload: bytes, *, priority: int = 0) -> None:
+    def send(self, payload: bytes, *, priority: int = 0,
+             operator_initiated: bool = False) -> None:
         if self.stop_event.is_set() or not self.connected_event.is_set():
             raise ConnectionError("Data2G connection is closed")
         if priority > 0:
             # Bulk history, proofs, and image fragments are repairable by a
             # later sync/request. Never stall the modem receive callback while
             # waiting for room here; its frames keep this queue draining.
-            self.bulk_outbound.put_nowait(payload)
+            self.bulk_outbound.put_nowait((payload, operator_initiated))
         else:
             # The KISS reader also processes ACKMODE replies. Blocking here
             # could prevent it from freeing the in-flight window.
-            self.outbound.put_nowait(payload)
+            self.outbound.put_nowait((payload, operator_initiated))
         self._debug_frames("TX_QUEUE", (payload,))
+
+    def send_operator_initiated(self, payload: bytes, *, priority: int = 0) -> None:
+        self.send(payload, priority=priority, operator_initiated=True)
 
     def _debug_frames(self, event: str, records) -> None:
         if self.on_debug:
@@ -408,6 +589,9 @@ class Data2G:
                     buffer[:] = tail
                     if raw:
                         line = raw.decode("ascii", "replace").strip()
+                        if self.live_command_pending.is_set():
+                            self.live_command_responses.put(line)
+                            continue
                         if self.transport == "connected" and line.startswith("CONNECTED "):
                             fields = line.split()
                             peer = next((field for field in fields[1:3]
@@ -463,8 +647,8 @@ class Data2G:
                 self.stop_event.set()
 
     def _write_data(self):
-        pending_normal: bytes | None = None
-        pending_bulk: bytes | None = None
+        pending_normal: tuple[bytes, bool] | None = None
+        pending_bulk: tuple[bytes, bool] | None = None
         while not self.stop_event.is_set():
             if not self.session_event.wait(0.25):
                 continue
@@ -485,6 +669,7 @@ class Data2G:
                             continue
             if item is None:
                 return
+            item, _operator_initiated = item
             source_queue = self.bulk_outbound if from_bulk else self.outbound
             records = [item]
             while True:
@@ -494,13 +679,14 @@ class Data2G:
                     break
                 if queued is None:
                     break
-                if pack_batch(records + [queued], max_bytes=255) is None:
+                queued_payload, _queued_operator = queued
+                if pack_batch(records + [queued_payload], max_bytes=255) is None:
                     if from_bulk:
                         pending_bulk = queued
                     else:
                         pending_normal = queued
                     break
-                records.append(queued)
+                records.append(queued_payload)
             payload = pack_batch(records, max_bytes=255) or item
             if len(payload) > 255:
                 self._status("ARQ record exceeds Data2G's 255-byte stream limit")
@@ -520,10 +706,11 @@ class Data2G:
 
     def _write_kiss(self):
         next_ax25_tx = 0.0
-        pending_normal: bytes | None = None
-        pending_bulk: bytes | None = None
+        pending_normal: tuple[bytes, bool] | None = None
+        pending_bulk: tuple[bytes, bool] | None = None
         last_normal_tag: bytes | None = None
         while not self.stop_event.is_set():
+            self._apply_policy_requests()
             if pending_normal is not None:
                 item, pending_normal, from_bulk = pending_normal, None, False
             else:
@@ -541,6 +728,7 @@ class Data2G:
                             continue
             if item is None:
                 return
+            item, operator_initiated = item
             records = [item]
             try:
                 if self.transport in {"ax25", "broadcast"}:
@@ -569,13 +757,20 @@ class Data2G:
                             break
                         if queued is None:
                             break
-                        if pack_batch(records + [queued], max_bytes=frame_limit) is None:
+                        queued_payload, queued_operator = queued
+                        if queued_operator != operator_initiated:
                             if from_bulk:
                                 pending_bulk = queued
                             else:
                                 pending_normal = queued
                             break
-                        records.append(queued)
+                        if pack_batch(records + [queued_payload], max_bytes=frame_limit) is None:
+                            if from_bulk:
+                                pending_bulk = queued
+                            else:
+                                pending_normal = queued
+                            break
+                        records.append(queued_payload)
                     info = pack_batch(records, max_bytes=frame_limit) or item
                     if self.transport == "ax25":
                         frame = encode_ui_frame(self.callsign, self.ax25_destination,
@@ -594,6 +789,11 @@ class Data2G:
                         next_ax25_tx = (time.monotonic() + estimated_airtime +
                                         self.ax25_interframe_delay)
                     else:
+                        desired_mode = (self.manual_mode if operator_initiated
+                                        else self.auto_mode) if self.unattended else self.manual_mode
+                        if desired_mode and desired_mode != self.current_broadcast_mode:
+                            self._set_live_broadcast_mode(desired_mode)
+                            self.current_broadcast_mode = desired_mode
                         self._set_tx_state("waiting for ACKMODE slot")
                         tag = self._reserve_kiss_tag()
                         if tag is None:
@@ -606,6 +806,12 @@ class Data2G:
                         self._set_tx_state("idle")
                         if not from_bulk:
                             last_normal_tag = tag
+                        if operator_initiated and self.unattended and self.auto_mode != desired_mode:
+                            self._set_tx_state("restoring unattended Data2G mode")
+                            self._wait_for_kiss_ack(tag)
+                            last_normal_tag = None
+                            self._set_live_broadcast_mode(self.auto_mode)
+                            self.current_broadcast_mode = self.auto_mode
                 else:
                     self._set_tx_state("waiting for ACKMODE slot")
                     tag = self._reserve_kiss_tag()
@@ -617,7 +823,7 @@ class Data2G:
                         self.tx_last_submit = time.monotonic()
                     self._set_tx_state("idle")
                 self._debug_frames("TX_SUBMIT", records)
-            except OSError as exc:
+            except (OSError, RuntimeError, TimeoutError) as exc:
                 self._set_tx_state("write failed")
                 if self.transport != "ax25":
                     self._forget_kiss_tag(tag)

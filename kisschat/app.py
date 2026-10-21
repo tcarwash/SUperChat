@@ -112,6 +112,9 @@ class Chat:
             raise ValueError("connected transport needs command port + 1 for data")
         os.makedirs(os.path.dirname(os.path.abspath(args.db)), exist_ok=True)
         self.store = Store(args.db, args.callsign)
+        saved_unattended = self.store.saved_setting("unattended")
+        self.unattended = (True if getattr(args, "unattended", False) else
+                           saved_unattended == "1" if saved_unattended is not None else False)
         self.events = ChatEventQueue()
         self.channel = (getattr(args, "channel", None) or self.store.saved_channel()
                         or "#general")
@@ -192,6 +195,7 @@ class Chat:
                            kiss_tnc_port=getattr(args, "kiss_tnc_port", 0),
                            ax25_baud=getattr(args, "ax25_baud", 1200),
                            ax25_interframe_delay=getattr(args, "ax25_interframe_delay", 0.25),
+                           unattended=self.unattended,
                            on_frame=self._on_frame,
                            on_frame_context=self._on_frame,
                            on_status=self._on_data_status,
@@ -332,19 +336,35 @@ class Chat:
                 next_sync = (time.monotonic() + AUTO_SYNC_INTERVAL_SECONDS +
                              secrets.randbelow(AUTO_SYNC_JITTER_SECONDS + 1))
 
-    def send_record(self, record: dict, *, priority: int = 0) -> bool:
+    def send_record(self, record: dict, *, priority: int = 0,
+                    operator_initiated: bool = False) -> bool:
         try:
             payload = pack(record)
-            return self.send_payload(payload, priority=priority)
+            return self.send_payload(payload, priority=priority,
+                                     operator_initiated=operator_initiated)
         except (ValueError, OSError, queue.Full, ConnectionError) as exc:
             self.events.put(("status", f"Transmit queue: {exc}"))
             return False
 
-    def send_payload(self, payload: bytes, *, priority: int = 0) -> bool:
+    def set_unattended(self, enabled: bool) -> None:
+        """Change and persist the live automatic-transmit bandwidth policy."""
+        self.data.set_unattended(enabled)
+        self.unattended = bool(enabled)
+        self.args.unattended = self.unattended
+        self.store.save_setting("unattended", "1" if self.unattended else "0")
+        self._debug_log("BANDWIDTH_POLICY_UI", {"unattended": self.unattended})
+        self.events.put(("status", "Unattended bandwidth policy " +
+                         ("enabled" if self.unattended else "disabled")))
+
+    def send_payload(self, payload: bytes, *, priority: int = 0,
+                     operator_initiated: bool = False) -> bool:
         try:
             if len(payload) > MAX_FRAME:
                 raise ValueError("control record too large")
-            self.data.send(payload, priority=priority)
+            if operator_initiated and hasattr(self.data, "send_operator_initiated"):
+                self.data.send_operator_initiated(payload, priority=priority)
+            else:
+                self.data.send(payload, priority=priority)
             return True
         except (ValueError, OSError, queue.Full, ConnectionError) as exc:
             self.events.put(("status", f"Transmit queue: {exc}"))
@@ -776,9 +796,11 @@ class Chat:
                 if seen <= cutoff:
                     self.cq_frames.pop(callsign, None)
 
-    def _send_routed_record(self, record: dict, key: tuple, *, priority: int = 0) -> bool:
+    def _send_routed_record(self, record: dict, key: tuple, *, priority: int = 0,
+                            operator_initiated: bool = False) -> bool:
         self._route_once(key, int(record.get("ttl", 4)))
-        return self.send_record(record, priority=priority)
+        return self.send_record(record, priority=priority,
+                                operator_initiated=operator_initiated)
 
     def _relay_record(self, record: dict, key: tuple, *, priority: int = 0) -> None:
         ttl = int(record.get("ttl", 0))
@@ -820,7 +842,10 @@ class Chat:
         for frame in message_parts(origin=self.store.node, seq=seq, channel=channel,
                                    nick=nick, timestamp=timestamp, text=body):
             try:
-                self.data.send(frame)
+                if hasattr(self.data, "send_operator_initiated"):
+                    self.data.send_operator_initiated(frame)
+                else:
+                    self.data.send(frame)
             except (OSError, queue.Full, ConnectionError) as exc:
                 self.events.put(("status", f"Could not queue message fragment: {exc}"))
                 delivery_queued = False
@@ -1679,7 +1704,7 @@ class Chat:
                   "h": image["digest"], "b": image["size"],
                   "w": image["width"], "hgt": image["height"], "ttl": 4}
         self._send_routed_record(record, ("a", "", message["o"], message["s"],
-                                          image["digest"]))
+                                          image["digest"]), operator_initiated=True)
 
     def _send_image(self, recipient: str, origin: str, seq: int, digest: str,
                     body: bytes, request_id: str, indexes: list[int] | None = None) -> None:
@@ -2121,7 +2146,10 @@ def main():
                         help="on-air station callsign (AX.25 allows 1–6 characters plus optional -SSID)")
     parser.add_argument("--nick", help="display nickname; defaults to callsign")
     parser.add_argument("--channel", help="initial channel (defaults to last used, then #general)")
-    parser.add_argument("--mode", default="", help="optional Data2G broadcast transmit mode")
+    parser.add_argument("--mode", default="",
+                        help="Data2G broadcast mode; in unattended mode this is used for explicit operator sends")
+    parser.add_argument("--unattended", action="store_true",
+                        help="use a host-advertised Data2G broadcast mode at or below 500 Hz for automatic sync/relay; explicit sends may use --mode or the widest host mode")
     parser.add_argument("--transport", choices=("broadcast", "connected", "ax25"), default="broadcast",
                         help="Data2G broadcast, VARA-compatible connected ARQ, or AX.25 UI over raw KISS")
     parser.add_argument("--bandwidth", choices=("500", "1200", "2300", "2750"),

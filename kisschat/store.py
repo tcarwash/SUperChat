@@ -186,6 +186,15 @@ class Store:
         with self.lock:
             return self._meta("channel")
 
+    def saved_setting(self, key: str) -> str | None:
+        with self.lock:
+            return self._meta(f"setting:{key}")
+
+    def save_setting(self, key: str, value: str) -> None:
+        with self.lock:
+            self._set_meta(f"setting:{key}", value)
+            self.db.commit()
+
     def save_channel(self, channel: str) -> None:
         if not CHANNEL_NAME.fullmatch(channel):
             raise ValueError("invalid channel name")
