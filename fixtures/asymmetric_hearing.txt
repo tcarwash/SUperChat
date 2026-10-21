@@ -1,0 +1,11 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology asymmetric --loss 0 --contention-window 10 --time-scale 0.1 --script fixtures/asymmetric_hearing.txt --json-report /tmp/kisschat-asymmetric-report.json
+send A one-way audible from A
+wait 4
+verify-hearing B A
+verify-hearing C A
+send C one-way reply from C
+wait 4
+verify-hearing B C
+verify-deaf A C
+stats
+quit

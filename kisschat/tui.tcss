@@ -1,0 +1,359 @@
+Screen {
+    background: #080d16;
+    color: #e7edf7;
+}
+
+#shell {
+    height: 1fr;
+    padding: 1;
+    layout: horizontal;
+}
+
+.panel {
+    height: 1fr;
+    border: round #25334a;
+    background: #0e1521;
+    padding: 1 2;
+}
+
+#sidebar {
+    width: 27;
+    margin-right: 1;
+}
+
+#conversation {
+    width: 1fr;
+    padding: 1 2;
+    background: #0b111b;
+    border: round #2a3650;
+}
+
+#rail {
+    width: 28;
+    margin-left: 1;
+    padding: 1 2;
+}
+
+#brand {
+    height: 2;
+    color: #d9ccff;
+    text-style: bold;
+    content-align: left middle;
+}
+
+.eyebrow {
+    height: 1;
+    color: #73839c;
+    text-style: bold;
+}
+
+#my-station {
+    height: 3;
+    margin-top: 1;
+    padding: 0 1;
+    color: #b8f4d7;
+    background: #10251f;
+    border: round #245543;
+    content-align: left middle;
+}
+
+.section-label {
+    margin-top: 2;
+}
+
+#channels {
+    height: 1fr;
+    min-height: 7;
+    margin-top: 1;
+    border: none;
+    background: #0e1521;
+    color: #c4cfde;
+    scrollbar-color: #34415a;
+}
+
+#channels > .option-list--option {
+    padding: 0 1;
+    height: 2;
+}
+
+#channels > .option-list--option-highlighted {
+    background: #252341;
+    color: #f1edff;
+}
+
+#join-channel {
+    width: 100%;
+    height: 3;
+    margin-top: 1;
+    color: #d8ccff;
+    background: #211d38;
+    border: round #554a83;
+}
+
+#history-note {
+    height: 4;
+    margin-top: 1;
+    color: #8a98ae;
+}
+
+#room-header {
+    height: 4;
+    border-bottom: solid #28344a;
+    margin-bottom: 1;
+}
+
+#room-name {
+    width: auto;
+    height: 2;
+    color: #f0ecff;
+    text-style: bold;
+    content-align: left middle;
+    padding-right: 2;
+}
+
+#room-meta {
+    width: 1fr;
+    height: 2;
+    color: #73839c;
+    content-align: left middle;
+}
+
+#load-older {
+    height: 3;
+    min-width: 24;
+    margin: 0 0 1 0;
+    color: #cbd8ee;
+    background: #142236;
+    border: round #344c69;
+}
+
+#messages {
+    height: 1fr;
+    border: none;
+    background: #0b111b;
+    padding: 1 0;
+    scrollbar-color: #34415a;
+}
+
+#composer-label {
+    height: 1;
+    color: #8e9bb0;
+    text-style: bold;
+    margin-top: 1;
+}
+
+#composer {
+    height: 3;
+    margin-top: 1;
+    border: round #465276;
+    background: #121a29;
+    color: #f0f4fb;
+}
+
+#attach-image {
+    height: 3;
+    margin-top: 1;
+    color: #cbd8ee;
+    background: #142236;
+    border: round #344c69;
+}
+
+#composer:focus {
+    border: round #9c88eb;
+}
+
+#composer-hint {
+    height: 1;
+    color: #65738a;
+    margin-top: 1;
+}
+
+#link-state {
+    height: 2;
+    color: #94edc3;
+    text-style: bold;
+    margin-top: 1;
+}
+
+#link-detail {
+    height: 3;
+    color: #8795aa;
+    border-bottom: solid #25334a;
+    padding-bottom: 1;
+}
+
+#station-card {
+    height: 4;
+    margin-top: 1;
+    color: #d7d2ef;
+}
+
+#station-list {
+    height: 5;
+    min-height: 3;
+    margin-top: 1;
+    color: #a7b7c9;
+}
+
+#image-list {
+    height: 6;
+    min-height: 3;
+    margin-top: 1;
+    border: none;
+    background: #0e1521;
+    color: #c4cfde;
+}
+
+#image-list > .option-list--option {
+    padding: 0 1;
+    height: 2;
+}
+
+#image-list > .option-list--option-highlighted {
+    background: #252341;
+    color: #f1edff;
+}
+
+#request-image {
+    height: 3;
+    margin-top: 1;
+    color: #cbd8ee;
+    background: #142236;
+    border: round #344c69;
+}
+
+#sync-card {
+    height: 4;
+    margin-top: 1;
+    color: #a9d8c5;
+    background: #10211d;
+    border: round #24483d;
+    padding: 0 1;
+    content-align: left middle;
+}
+
+#activity {
+    height: 3;
+    margin-top: 1;
+    color: #c6b9ef;
+}
+
+Screen.-tall #rail .section-label {
+    margin-top: 1;
+}
+
+Screen.-tall #link-state {
+    height: 1;
+    margin-top: 0;
+}
+
+Screen.-tall #link-detail {
+    height: 3;
+    padding-bottom: 0;
+}
+
+Screen.-tall #station-card {
+    height: 3;
+    margin-top: 0;
+}
+
+Screen.-tall #station-list {
+    height: 4;
+    margin-top: 0;
+}
+
+Screen.-tall #image-list {
+    height: 5;
+    margin-top: 0;
+}
+
+Screen.-tall #request-image {
+    height: 3;
+    margin-top: 0;
+}
+
+Screen.-tall #sync-card {
+    height: 4;
+    margin-top: 0;
+}
+
+Screen.-tall #activity {
+    height: 2;
+    margin-top: 0;
+}
+
+Footer {
+    background: #111827;
+    color: #8795aa;
+}
+
+Screen.-medium #rail {
+    display: none;
+}
+
+Screen.-compact #sidebar {
+    display: none;
+}
+
+Screen.-compact #rail {
+    display: none;
+}
+
+Screen.-compact #conversation {
+    margin: 0;
+}
+
+Screen.-short #shell {
+    padding: 0;
+}
+
+Screen.-short #sidebar,
+Screen.-short #rail {
+    display: none;
+}
+
+Screen.-short #conversation {
+    padding: 0 1;
+    border: none;
+    margin: 0;
+}
+
+Screen.-short #room-header {
+    height: 2;
+    margin-bottom: 0;
+}
+
+Screen.-short #room-name {
+    height: 1;
+}
+
+Screen.-short #room-meta,
+Screen.-short #composer-label,
+Screen.-short #composer-hint {
+    display: none;
+}
+
+Screen.-short #load-older {
+    height: 1;
+    min-width: 0;
+    margin: 0;
+    padding: 0 1;
+    border: none;
+}
+
+Screen.-short #messages {
+    padding: 0;
+}
+
+Screen.-short #composer {
+    height: 1;
+    margin: 0;
+    border: none;
+}
+
+Screen.-short #attach-image {
+    height: 1;
+    margin: 0;
+    padding: 0 1;
+    border: none;
+}

@@ -1,0 +1,12 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --contention-window 10 --time-scale 0.1 --script fixtures/requested_thumbnail.txt
+send-image A thumbnail should wait for a receiver request
+wait 15
+forget C A
+sync C A
+wait 10
+verify-image-metadata C A
+request-image C A
+wait 20
+verify-image-received C
+verify
+quit

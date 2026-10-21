@@ -1,0 +1,10 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --contention-window 1 --time-scale 0.1 --script fixtures/history_window.txt
+send-aged A 176401 Outside the 48-hour history window
+send-aged A 169200 Inside the 48-hour history window
+wait 12
+forget C A
+sync C A
+wait 10
+verify-history-window C A
+history C
+quit

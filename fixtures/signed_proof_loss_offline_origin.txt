@@ -1,0 +1,16 @@
+# Run with: uv run python scripts/run_signed_mesh.py -- --topology line --loss 0 --time-scale 0.1 --contention-window 10 --drop-first-proof-fragment --trace-sync --json-report /tmp/kisschat-signed-proof-loss.json --script fixtures/signed_proof_loss_offline_origin.txt
+partition B C
+send A signed proof must survive its author going offline
+wait-radio-idle
+wait 3
+verify-signed-isolated B A
+stop-station A
+verify-offline A
+rejoin B C
+sync C A
+wait 30
+verify-proof C A
+start-station A
+verify-restarted A
+verify
+quit

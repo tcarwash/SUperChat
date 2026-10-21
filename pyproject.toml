@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superchat"
+version = "0.1.0"
+description = "SUperChat: channel chat and history sync over Data2G KISS"
+requires-python = ">=3.10"
+dependencies = ["textual>=8.2.8,<9", "Pillow>=11,<13", "rich>=14,<16",
+                "Pygments>=2.17,<3"]
+
+[project.optional-dependencies]
+bundle = ["pyinstaller>=6,<7"]
+
+[project.scripts]
+kisschat = "kisschat.app:main"
+superchat = "kisschat.app:main"
+
+[tool.setuptools]
+packages = ["kisschat"]
+
+[tool.setuptools.package-data]
+kisschat = ["*.tcss"]

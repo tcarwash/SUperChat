@@ -1,0 +1,10 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --bitrate 9600 --interframe 0.02 --propagation 0.01 --contention-window 0.02 --batch-window 0.005 --time-scale 1 --sync-retry-seconds 8 --delay-first-history-page-end 10 --trace-sync --json-report /tmp/kisschat-delayed-page-end.json --script fixtures/delayed_history_page_end.txt
+partition B C
+send A random 3000
+wait 8
+rejoin B C
+sync C A
+wait 13
+verify-delayed-page-end
+verify
+quit

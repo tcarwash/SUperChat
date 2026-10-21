@@ -1,0 +1,26 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0.05 --contention-window 10 --time-scale 0.1 --script fixtures/three_station_conversation.txt
+send A Hello from the west end.
+wait 3
+send B B can hear both ends.
+wait 3
+send C Hello from the east end.
+wait 12
+sync A
+wait 8
+sync C
+wait 20
+sync A C
+wait 12
+sync C A
+wait 20
+# Repeat both edge-to-edge fetches after random loss or a hidden-terminal
+# collision. Explicit sync clears stale completion state and retries gaps.
+sync A C
+wait 8
+sync C A
+wait 20
+history A
+history B
+history C
+verify
+quit

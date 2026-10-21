@@ -1,0 +1,19 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --time-scale 0.1 --sync-retry-seconds 2 --json-report /tmp/kisschat-restart-all.json --script fixtures/restart_all_stations.txt
+send A restart durability check
+wait 5
+stop-station A
+verify-offline A
+start-station A
+verify-restarted A
+stop-station B
+verify-offline B
+start-station B
+verify-restarted B
+stop-station C
+verify-offline C
+start-station C
+verify-restarted C
+sync C A
+wait 8
+verify
+quit

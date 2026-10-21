@@ -1,0 +1,9 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --contention-window 10 --time-scale 0.1 --script fixtures/no_echo.txt
+send A Message for C to cache during its sync
+wait 10
+forget C A
+sync C A
+wait 10
+verify-no-echo
+history C
+quit

@@ -1,0 +1,11 @@
+# Run with: uv run python scripts/simulate_mesh.py --transport ax25 --topology line --loss 0 --time-scale 0.1 --script fixtures/ax25_line_smoke.txt
+send A AX.25 UI frame from the west end.
+wait 2
+sync C A
+wait 8
+history A
+history B
+history C
+verify
+stats
+quit

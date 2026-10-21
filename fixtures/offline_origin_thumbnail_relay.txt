@@ -1,0 +1,19 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --contention-window 10 --time-scale 0.1 --trace-sync --json-report /tmp/kisschat-offline-thumbnail.json --script fixtures/offline_origin_thumbnail_relay.txt
+send-image A cached offline thumbnail
+wait 15
+sync B A
+wait 10
+request-image B A
+wait 15
+verify-image-received B
+stop-station A
+verify-offline A
+forget C A
+sync C A
+wait 10
+verify-offline-image-cache B A
+request-image C A
+wait 20
+verify-image-received C
+verify
+quit

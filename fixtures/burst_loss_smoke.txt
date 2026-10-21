@@ -1,0 +1,12 @@
+# Run with: uv run python scripts/run_loss_matrix.py --loss-model bursty --loss 0.05 0.15 0.30 --script fixtures/burst_loss_smoke.txt --output /tmp/kisschat-burst-loss.json
+send A burst-loss repair message
+wait 1
+sync A
+wait 5
+sync C A
+wait 5
+sync C A
+wait 8
+verify
+stats
+quit

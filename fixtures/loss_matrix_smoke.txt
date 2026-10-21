@@ -1,0 +1,12 @@
+# Run with: uv run python scripts/run_loss_matrix.py --script fixtures/loss_matrix_smoke.txt
+send A seeded-loss matrix message
+wait 1
+sync A
+wait 5
+sync C A
+wait 5
+sync C A
+wait 8
+verify
+stats
+quit

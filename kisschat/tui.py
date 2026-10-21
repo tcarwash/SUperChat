@@ -1,0 +1,1130 @@
+"""Pane-based terminal interface for SUperChat."""
+from __future__ import annotations
+
+import asyncio
+import re
+import queue
+import shlex
+import shutil
+import time
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+from rich.text import Text
+from rich.console import Group
+from rich.markup import escape
+from rich.style import Style
+from rich.syntax import Syntax
+from pygments.lexers import get_lexer_by_name
+from pygments.util import ClassNotFound
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual import events
+from textual.css.query import NoMatches
+from textual.screen import ModalScreen
+from textual.suggester import Suggester
+from textual.widgets import Button, Footer, Input, Label, OptionList, RichLog, Static
+from textual.widgets.option_list import Option
+
+from .app import Chat
+from .images import render_thumbnail
+from .mentions import (BARE_MENTION, MENTION, MENTION_RE, format_mention,
+                       mention_name, valid_mention_name)
+
+
+IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+
+
+def _image_path_from_paste(text: str) -> str | None:
+    """Resolve one terminal-dropped image path or local URI-list entry."""
+    # Some terminals paste a plain path, while file managers may expose a
+    # text/uri-list containing comments and CRLF separators. Accept one entry
+    # from either representation, but never guess which file to attach when
+    # several are dropped together.
+    lines = [line.strip() for line in text.splitlines()]
+    entries = [line for line in lines if line and not line.startswith("#")]
+    if len(entries) != 1:
+        return None
+
+    def resolve(value: str) -> str | None:
+        if value.casefold().startswith("file:"):
+            uri = urlparse(value)
+            if uri.scheme != "file" or uri.netloc not in ("", "localhost"):
+                return None
+            value = unquote(uri.path)
+        path = Path(value).expanduser()
+        if path.suffix.casefold() not in IMAGE_SUFFIXES or not path.is_file():
+            return None
+        return str(path.resolve())
+
+    # Several terminals paste a dropped filename with spaces but without shell
+    # quoting. Try the complete line first so it remains a single path.
+    entry = entries[0]
+    path = resolve(entry)
+    if path:
+        return path
+    # Other terminals quote or escape dropped paths; accept those as well.
+    try:
+        fields = shlex.split(entry)
+    except ValueError:
+        return None
+    return resolve(fields[0]) if len(fields) == 1 else None
+
+
+class ComposerInput(Input):
+    """Recognize terminal file drops while preserving normal pasted text."""
+
+    def __init__(self, *, on_image_drop, **kwargs):
+        super().__init__(**kwargs)
+        self.on_image_drop = on_image_drop
+
+    def _on_paste(self, event: events.Paste) -> None:
+        path = _image_path_from_paste(event.text)
+        if path and self.on_image_drop(path):
+            event.stop()
+            event.prevent_default()
+            return
+        super()._on_paste(event)
+
+
+class ImagePathInput(Input):
+    """Normalize terminal-dropped paths inside the image attachment dialog."""
+
+    def _on_paste(self, event: events.Paste) -> None:
+        path = _image_path_from_paste(event.text)
+        if path:
+            self.value = path
+            self.cursor_position = len(path)
+            event.stop()
+            event.prevent_default()
+            return
+        super()._on_paste(event)
+
+
+class ChatSuggester(Suggester):
+    """Complete mentions and connected-mode calls from heard stations."""
+
+    def __init__(self, names, stations):
+        super().__init__(use_cache=False, case_sensitive=False)
+        self.names, self.stations = names, stations
+
+    async def get_suggestion(self, value: str) -> str | None:
+        connect = re.search(r"(?i)(?<!\S)/connect\s+([A-Za-z0-9/-]*)$", value)
+        if connect:
+            prefix = connect.group(1).casefold()
+            for callsign in self.stations():
+                if callsign.casefold().startswith(prefix) and callsign.casefold() != prefix:
+                    return value[:connect.start(1)] + callsign + " "
+        match = re.search(r'(?<![\w])@"([^"\n]*)$', value)
+        if match:
+            prefix = match.group(1).casefold()
+            for name in self.names():
+                if valid_mention_name(name) and name.casefold().startswith(prefix):
+                    return value[:match.start(1)] + name + '" '
+            return None
+        match = re.search(r"(?<![\w])@([A-Za-z0-9_/-]*)$", value)
+        if not match:
+            return None
+        prefix = match.group(1).casefold()
+        for name in self.names():
+            if BARE_MENTION.fullmatch(name) and name.casefold().startswith(prefix):
+                return value[:match.start(1)] + name + " "
+        return None
+
+
+class ChannelSwitcher(ModalScreen[str | None]):
+    BINDINGS = [("escape", "dismiss(None)", "Close")]
+    CSS = """
+    ChannelSwitcher { align: center middle; background: $background 75%; }
+    #switcher-box { width: 1fr; max-width: 62; height: 18; margin: 0 1; padding: 1 2; border: round $accent; background: #111827; }
+    #switcher-title { height: 1; color: #d8ccff; text-style: bold; margin-bottom: 1; }
+    #channel-search { margin-bottom: 1; }
+    #channel-matches { height: 1fr; border: none; background: #111827; }
+    """
+
+    def __init__(self, channels: list[str]):
+        super().__init__()
+        self.channels = channels
+        self.matches = channels
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="switcher-box"):
+            yield Label("JUMP TO CHANNEL", id="switcher-title")
+            yield Input(placeholder="Type a channel name…", id="channel-search")
+            yield OptionList(id="channel-matches")
+
+    def on_mount(self) -> None:
+        self._fill("")
+        self.query_one("#channel-search", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "channel-search":
+            self._fill(event.value)
+
+    def _fill(self, query: str) -> None:
+        needle = query.casefold().lstrip("#")
+        if not needle:
+            self.matches = list(self.channels)
+        else:
+            def rank(name: str):
+                value = name.lstrip("#").casefold()
+                if needle in value:
+                    return (0, value.index(needle), len(value))
+                pos = -1
+                for char in needle:
+                    pos = value.find(char, pos + 1)
+                    if pos < 0:
+                        return None
+                return (1, pos, len(value))
+            ranked = [(score, name) for name in self.channels
+                      if (score := rank(name)) is not None]
+            self.matches = [name for _, name in sorted(ranked)]
+        options = [Option(f"  {name}", id=f"match-{index}")
+                   for index, name in enumerate(self.matches)]
+        listing = self.query_one("#channel-matches", OptionList)
+        listing.clear_options()
+        listing.add_options(options)
+        if options:
+            listing.highlighted = 0
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "channel-matches" and event.option_index < len(self.matches):
+            self.dismiss(self.matches[event.option_index])
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "channel-search":
+            query = event.value.strip()
+            if query.startswith("#") and re.fullmatch(r"#[A-Za-z0-9_-]{1,31}", query):
+                self.dismiss(query)
+            elif self.matches:
+                self.dismiss(self.matches[0])
+
+
+class MessageSearchScreen(ModalScreen[str | None]):
+    BINDINGS = [("escape", "dismiss(None)", "Close")]
+    CSS = """
+    MessageSearchScreen { align: center middle; background: $background 75%; }
+    #message-search-box { width: 1fr; max-width: 72; height: 13; margin: 0 1; padding: 1 2; border: round $accent; background: #111827; }
+    #message-search-title { height: 1; color: #d8ccff; text-style: bold; margin-bottom: 1; }
+    #message-search-help { height: 2; color: #8a98ae; margin-top: 1; }
+    #message-search-actions { height: 3; align: right middle; }
+    #message-search-actions Button { margin-left: 1; }
+    """
+
+    def __init__(self, query: str = ""):
+        super().__init__()
+        self.query = query
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="message-search-box"):
+            yield Label("SEARCH THIS CHANNEL", id="message-search-title")
+            yield Input(value=self.query, placeholder="Find text in local and synced history…",
+                        id="message-search-input")
+            yield Static("Search is literal and case-insensitive. Leave empty to show the timeline.",
+                         id="message-search-help")
+            with Horizontal(id="message-search-actions"):
+                yield Button("Cancel", id="message-search-cancel")
+                yield Button("Search", id="message-search-submit", variant="primary")
+
+    def on_mount(self) -> None:
+        field = self.query_one("#message-search-input", Input)
+        field.focus()
+        field.cursor_position = len(field.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "message-search-input":
+            self.dismiss(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "message-search-cancel":
+            self.dismiss(None)
+        elif event.button.id == "message-search-submit":
+            self.dismiss(self.query_one("#message-search-input", Input).value)
+
+
+class ImageAttachScreen(ModalScreen[tuple[str, str] | None]):
+    BINDINGS = [("escape", "dismiss(None)", "Close")]
+    CSS = """
+    ImageAttachScreen { align: center middle; background: $background 75%; }
+    #image-box { width: 1fr; max-width: 76; height: 19; margin: 0 1; padding: 1 2; border: round $accent; background: #111827; }
+    #image-actions { width: 100%; height: 3; }
+    #image-actions Button {
+        width: 1fr;
+        min-width: 12;
+        height: 3;
+        margin-right: 1;
+        padding: 0 1;
+        color: #f0edff;
+        background: #26334a;
+        border: round #596985;
+        text-style: bold;
+        content-align: center middle;
+    }
+    #image-actions #send-image {
+        margin-right: 0;
+        color: #ffffff;
+        background: #493d78;
+        border: round #8f7bd4;
+    }
+    #image-title { height: 1; color: #d8ccff; text-style: bold; margin-bottom: 1; }
+    #image-caption { margin-top: 1; }
+    #image-help { height: 2; color: #aebbd0; margin-top: 1; }
+    """
+
+    def __init__(self, path: str = ""):
+        super().__init__()
+        self.path = path
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="image-box"):
+            yield Label("ATTACH A RADIO THUMBNAIL", id="image-title")
+            yield ImagePathInput(value=self.path, placeholder="Path to JPEG, PNG, WebP…",
+                                 id="image-path")
+            yield Input(placeholder="Caption (optional)", id="image-caption")
+            yield Static("Enter sends · Tab adds a caption · Thumbnail ≤160 px / 8 KiB\n"
+                         "Image bytes are sent only when requested.", id="image-help")
+            with Horizontal(id="image-actions"):
+                yield Button("Browse files", id="browse-image", variant="default")
+                yield Button("Send image", id="send-image", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#image-path", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "browse-image":
+            self.run_worker(self._browse_image(), exclusive=True, group="image-picker")
+        elif event.button.id == "send-image":
+            self._submit_image()
+
+    async def _browse_image(self) -> None:
+        """Use an optional desktop chooser without blocking Textual's event loop."""
+        zenity = shutil.which("zenity")
+        kdialog = shutil.which("kdialog")
+        if zenity:
+            command = [zenity, "--file-selection", "--title=Choose an image",
+                       "--file-filter=Image files | *.png *.jpg *.jpeg *.webp *.gif *.bmp *.tif *.tiff"]
+        elif kdialog:
+            command = [kdialog, "--getopenfilename", str(Path.home()),
+                       "Image files (*.png *.jpg *.jpeg *.webp *.gif *.bmp *.tif *.tiff)"]
+        else:
+            self.query_one("#image-help", Static).update(
+                "No desktop file chooser found. Paste an image path above.")
+            return
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await process.communicate()
+        except OSError as exc:
+            self.query_one("#image-help", Static).update(f"Could not open file chooser: {exc}")
+            return
+        if process.returncode == 0:
+            path = stdout.decode("utf-8", "replace").strip()
+            if path:
+                field = self.query_one("#image-path", Input)
+                field.value = path
+                self.query_one("#image-caption", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "image-path":
+            self._submit_image()
+        elif event.input.id == "image-caption":
+            self._submit_image()
+
+    def _submit_image(self) -> None:
+        path = self.query_one("#image-path", Input).value.strip()
+        caption = self.query_one("#image-caption", Input).value.strip()
+        if path:
+            self.dismiss((path, caption))
+        else:
+            self.query_one("#image-path", Input).focus()
+
+
+class ClearHistoryScreen(ModalScreen[bool]):
+    BINDINGS = [("escape", "dismiss(False)", "Cancel")]
+    CSS = """
+    ClearHistoryScreen { align: center middle; background: $background 75%; }
+    #clear-history-box { width: 1fr; max-width: 72; height: auto; margin: 1 2; padding: 1 2; border: round $error; background: #111827; }
+    #clear-history-title { color: #ffd0d0; text-style: bold; margin-bottom: 1; }
+    #clear-history-help { height: auto; margin-bottom: 1; color: #c4ccda; }
+    #clear-history-actions { width: 100%; height: 3; }
+    #clear-history-actions Button { width: 1fr; margin-right: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="clear-history-box"):
+            yield Label("CLEAR LOCAL MESSAGE HISTORY?", id="clear-history-title")
+            yield Static("This deletes all messages and cached image data on this device. "
+                         "Queued frames are discarded; a frame already transmitting may finish. "
+                         "Other stations' copies cannot be erased and may sync back later.",
+                         id="clear-history-help")
+            with Horizontal(id="clear-history-actions"):
+                yield Button("Cancel", id="cancel-clear", variant="default")
+                yield Button("Delete local history", id="confirm-clear", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm-clear")
+
+
+class ImagePicker(ModalScreen[dict | None]):
+    BINDINGS = [("escape", "dismiss(None)", "Close")]
+    CSS = """
+    ImagePicker { align: center middle; background: $background 75%; }
+    #image-picker-box { width: 1fr; max-width: 72; height: 20; margin: 0 1; padding: 1 2; border: round $accent; background: #111827; }
+    #image-picker-title { height: 1; color: #d8ccff; text-style: bold; margin-bottom: 1; }
+    #image-picker-list { height: 1fr; border: none; background: #111827; }
+    #image-picker-empty { height: 1fr; color: #8a98ae; content-align: center middle; }
+    #image-picker-hint { height: 1; color: #8a98ae; margin-top: 1; }
+    """
+
+    def __init__(self, images: list[dict], store):
+        super().__init__()
+        self.images, self.store = images, store
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="image-picker-box"):
+            yield Label("REQUEST A CHANNEL THUMBNAIL", id="image-picker-title")
+            if self.images:
+                options = []
+                for index, image in enumerate(self.images):
+                    stamp = time.strftime("%H:%M", time.localtime(int(image["ts"])))
+                    if self.store.image_for(image["digest"]):
+                        state = "Downloaded"
+                    else:
+                        received, total = self.store.image_progress(image["origin"],
+                                                                    int(image["seq"]))
+                        state = (f"Resume {received}/{total}" if received
+                                 else "Select to fetch")
+                    options.append(Option(f"{escape(str(image['nick']))} · {stamp} · "
+                                          f"{image['width']}×{image['height']} · {state}",
+                                          id=f"image-{index}"))
+                yield OptionList(*options, id="image-picker-list")
+                yield Static("Select an image to request its thumbnail", id="image-picker-hint")
+            else:
+                yield Static("No image attachments in this channel yet.", id="image-picker-empty")
+
+    def on_mount(self) -> None:
+        if self.images:
+            self.query_one("#image-picker-list", OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "image-picker-list" and event.option_index < len(self.images):
+            self.dismiss(self.images[event.option_index])
+
+
+class ChatApp(App[None]):
+    TITLE = "SUperChat"
+    CSS_PATH = "tui.tcss"
+    HORIZONTAL_BREAKPOINTS = [(0, "-compact"), (77, "-medium"), (106, "-wide")]
+    VERTICAL_BREAKPOINTS = [(0, "-short"), (40, "-tall")]
+    BINDINGS = [
+        ("ctrl+shift+k", "switch_channel", "Channels"),
+        ("ctrl+shift+f", "search_messages", "Search"),
+        ("ctrl+l", "clear_messages", "Clear view"),
+        ("ctrl+q", "quit", "Quit"),
+    ]
+
+    def __init__(self, chat: Chat):
+        super().__init__()
+        self.chat = chat
+        self.channel = chat.channel
+        self.channel_drafts: dict[str, str] = {}
+        self.unread: dict[str, int] = {}
+        self.unread_mentions: dict[str, int] = {}
+        self.images: list[dict] = []
+        self.history_limit = 200
+        self.search_query: str | None = None
+        self.displayed_messages: set[tuple[str, int]] = set()
+        self.displayed_day: tuple[int, int] | None = None
+        self.last_status = "Broadcast link ready"
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="shell"):
+            with Vertical(id="sidebar", classes="panel"):
+                yield Static("✦  SUperChat", id="brand")
+                yield Static("RADIO MESH", classes="eyebrow")
+                yield Static(f"●  {self.chat.args.callsign}", id="my-station")
+                yield Static("CHANNELS", classes="eyebrow section-label")
+                yield OptionList(id="channels")
+                yield Button("＋  Join channel", id="join-channel", variant="default")
+                yield Static("HISTORY", classes="eyebrow section-label")
+                yield Static("Synced between stations\nStored on this device", id="history-note")
+            with Vertical(id="conversation", classes="panel"):
+                with Horizontal(id="room-header"):
+                    yield Static(self.channel, id="room-name")
+                    yield Static("Shared radio channel  ·  CHAT group", id="room-meta")
+                yield Button("↑ Load older", id="load-older", variant="default")
+                yield RichLog(id="messages", wrap=True, markup=False,
+                              highlight=False, auto_scroll=True)
+                yield Static("MESSAGE  ·  Enter to send  ·  @ to mention a station",
+                             id="composer-label")
+                yield ComposerInput(placeholder=f"Message {self.channel}", id="composer",
+                                    suggester=ChatSuggester(self._mention_targets,
+                                                            self._connect_targets),
+                                    max_length=4096, on_image_drop=self._open_dropped_image)
+                yield Button("＋ Image", id="attach-image", variant="default")
+                yield Static("＋ Image to browse or enter a path · Ctrl+Shift+K channels · /images",
+                             id="composer-hint")
+            with Vertical(id="rail", classes="panel"):
+                yield Static("LINK STATUS", classes="eyebrow")
+                yield Static("● CONNECTING", id="link-state")
+                detail = self._link_detail()
+                yield Static(detail, id="link-detail")
+                yield Static("YOUR STATION", classes="eyebrow section-label")
+                yield Static(f"{self.chat.nick}\n{self.chat.args.callsign}", id="station-card")
+                yield Static("HEARD STATIONS", classes="eyebrow section-label")
+                yield Static("Listening for stations…", id="station-list")
+                yield Static("RECENT IMAGES", classes="eyebrow section-label")
+                yield OptionList(id="image-list")
+                yield Button("↓  Request selected", id="request-image", variant="default")
+                yield Static("MESH SYNC", classes="eyebrow section-label")
+                yield Static("History relays on\nNo central server", id="sync-card")
+                yield Static("ACTIVITY", classes="eyebrow section-label")
+                yield Static(self.last_status, id="activity")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        unread_channels = self.chat.store.unread_summary()
+        for unread in unread_channels:
+            channel = unread["c"]
+            if channel == self.channel:
+                continue
+            self.unread[channel] = int(unread["messages"])
+            self.unread_mentions[channel] = int(unread["mentions"] or 0)
+        if any(unread["c"] == self.channel for unread in unread_channels):
+            self.chat.store.clear_unread(self.channel)
+        self._refresh_channels()
+        self._load_messages()
+        self.set_interval(0.15, self._drain_events)
+        self.query_one("#composer", Input).focus()
+        self._refresh_stations()
+        self._refresh_images()
+        self._refresh_stats()
+
+    def _channels(self) -> list[str]:
+        return sorted(set(self.chat.store.channels()) | {self.channel})
+
+    def _refresh_channels(self) -> None:
+        listing = self.query_one("#channels", OptionList)
+        channels = self._channels()
+        listing.clear_options()
+        listing.add_options([
+            Option(self._channel_label(channel), id=f"channel-{index}")
+            for index, channel in enumerate(channels)
+        ])
+        selected = channels.index(self.channel) if self.channel in channels else 0
+        listing.highlighted = selected
+
+    def _channel_label(self, channel: str) -> Text:
+        count = self.unread.get(channel, 0)
+        active = channel == self.channel
+        label = Text("▸ " if active else "  ", style="bold #bda8ff" if active else "#75839a")
+        label.append(channel, style="bold #f0edff" if active else "#b7c1d1")
+        if count:
+            label.append(f"  {count}", style="bold #a7f3d0")
+        mentions = self.unread_mentions.get(channel, 0)
+        if mentions:
+            label.append(f"  @{mentions}", style="bold #f9d56e")
+        return label
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "channels":
+            channels = self._channels()
+            if event.option_index < len(channels):
+                self._set_channel(channels[event.option_index])
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "join-channel":
+            self.action_switch_channel()
+        elif event.button.id == "attach-image":
+            self.push_screen(ImageAttachScreen(), self._send_attached_image)
+        elif event.button.id == "request-image":
+            listing = self.query_one("#image-list", OptionList)
+            if self.images and listing.highlighted is not None:
+                image = self.images[listing.highlighted]
+                self.chat.command(f"/image-get {image['origin']}:{image['seq']}")
+        elif event.button.id == "load-older":
+            self.history_limit += 200
+            self._load_messages()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Some terminal emulators deliver a file drop as ordinary input rather
+        # than a bracketed Paste event. Catch and normalize complete local paths
+        # in both the composer and the attachment dialog.
+        path = _image_path_from_paste(event.value)
+        if event.input.id == "image-path":
+            if path and event.value != path:
+                event.input.value = path
+            return
+        if event.input.id == "composer" and path:
+            event.input.value = ""
+            self._open_dropped_image(path)
+
+    def _send_attached_image(self, result: tuple[str, str] | None) -> None:
+        if not result:
+            return
+        path, caption = result
+        self.chat.queue_image(path, caption)
+        self.query_one("#composer", Input).focus()
+
+    def _open_dropped_image(self, path: str) -> bool:
+        self.push_screen(ImageAttachScreen(path), self._send_attached_image)
+        return True
+
+    def _set_channel(self, channel: str) -> None:
+        self.chat.command(f"/join {channel}")
+        self._show_channel(channel)
+
+    def _show_channel(self, channel: str) -> None:
+        composer = self.query_one("#composer", Input)
+        self.channel_drafts[self.channel] = composer.value
+        self.channel = channel
+        composer.value = self.channel_drafts.get(channel, "")
+        self.chat.store.clear_unread(channel)
+        self.search_query = None
+        self.history_limit = 200
+        self.unread.pop(channel, None)
+        self.unread_mentions.pop(channel, None)
+        self._apply_channel()
+
+    def _apply_channel(self) -> None:
+        self.query_one("#room-name", Static).update(self.channel)
+        self.query_one("#room-meta", Static).update(
+            "Shared radio channel  ·  CHAT group   ·   local and relayed history")
+        self.query_one("#composer", Input).placeholder = f"Message {self.channel}"
+        self._refresh_channels()
+        self._refresh_images()
+        self._load_messages()
+        self.query_one("#composer", Input).focus()
+
+    def action_switch_channel(self) -> None:
+        self.push_screen(ChannelSwitcher(self._channels()), self._switch_result)
+
+    def action_search_messages(self) -> None:
+        self.push_screen(MessageSearchScreen(self.search_query or ""), self._search_result)
+
+    def _search_result(self, query: str | None) -> None:
+        if query is None:
+            self.query_one("#composer", Input).focus()
+            return
+        self.search_query = query.strip() or None
+        self.history_limit = 200
+        self._load_messages()
+        self._refresh_images()
+        self.query_one("#composer", Input).focus()
+
+    def _switch_result(self, channel: str | None) -> None:
+        if channel:
+            self._set_channel(channel)
+
+    def _clear_history_result(self, confirmed: bool | None) -> None:
+        if confirmed:
+            deleted = self.chat.clear_local_history()
+            self.search_query = None
+            self.history_limit = 200
+            self._load_messages()
+            self._refresh_images()
+            self._refresh_channels()
+            queued = self.chat.last_purge_queued_frames
+            self.last_status = (f"Cleared {deleted} local messages and image data; "
+                                f"discarded {queued} queued frames")
+            self.query_one("#activity", Static).update(self._short_status(self.last_status))
+        self.query_one("#composer", Input).focus()
+
+    def action_clear_messages(self) -> None:
+        self.query_one("#messages", RichLog).clear()
+        self.displayed_messages.clear()
+        self.displayed_day = None
+        self.last_status = "View cleared · use /history to reload"
+        self.query_one("#activity", Static).update(self._short_status(self.last_status))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "composer":
+            return
+        content = event.value.strip()
+        event.input.value = ""
+        if not content:
+            return
+        if content.casefold() == "/images":
+            self.push_screen(ImagePicker(self.chat.store.recent_attachments(self.channel),
+                                         self.chat.store), self._request_picked_image)
+            return
+        command_parts = content.split(maxsplit=1)
+        command = command_parts[0].casefold()
+        argument = command_parts[1] if len(command_parts) == 2 else ""
+        if command == "/clear-history":
+            self.push_screen(ClearHistoryScreen(), self._clear_history_result)
+            return
+        if command == "/search":
+            self._search_result(argument)
+            return
+        if content.startswith("/"):
+            keep_running = self.chat.command(content)
+            if not keep_running:
+                self.exit()
+                return
+            if command == "/join" and self.chat.channel != self.channel:
+                self._show_channel(self.chat.channel)
+            elif command == "/nick":
+                self.query_one("#station-card", Static).update(
+                    f"{self.chat.nick}\n{self.chat.args.callsign}")
+            if command == "/history":
+                self.search_query = None
+                try:
+                    count = max(1, min(200, int(argument.strip() or "30")))
+                except ValueError:
+                    count = 30
+                self.history_limit = count
+                self._load_messages()
+                self._refresh_images()
+            self._refresh_channels()
+            self._refresh_stations()
+        else:
+            try:
+                self.chat.publish(content)
+                self._refresh_stats()
+            except (OSError, ValueError, OverflowError) as exc:
+                event.input.value = content
+                event.input.focus()
+                self.last_status = f"Message not sent: {exc}"
+                self.query_one("#activity", Static).update(self._short_status(self.last_status))
+
+    def _request_picked_image(self, image: dict | None) -> None:
+        if image:
+            self.chat.command(f"/image-get {image['origin']}:{image['seq']}")
+        self.query_one("#composer", Input).focus()
+
+    def _load_messages(self) -> None:
+        feed = self.query_one("#messages", RichLog)
+        feed.clear()
+        if self.search_query:
+            messages = self.chat.store.search_history(self.channel, self.search_query,
+                                                     self.history_limit)
+        else:
+            messages = self.chat.store.history(self.channel, self.history_limit)
+        self.displayed_messages = {(message["o"], int(message["s"]))
+                                   for message in messages}
+        self.displayed_day = None
+        for message in messages:
+            day, marker = self._day_marker(int(message["ts"]))
+            if day != self.displayed_day:
+                feed.write(marker, scroll_end=False)
+                self.displayed_day = day
+            feed.write(self._message_renderable(message), scroll_end=False)
+        feed.scroll_end(animate=False)
+        total = (self.chat.store.search_count(self.channel, self.search_query)
+                 if self.search_query else self.chat.store.history_count(self.channel))
+        meta = self.query_one("#room-meta", Static)
+        if self.search_query:
+            meta.update(Text(f'Search · "{self.search_query}" · {total} matches',
+                             style="#a8b2c3"))
+        else:
+            meta.update(Text("Shared radio channel  ·  CHAT group   ·  local and relayed history",
+                             style="#73839c"))
+        loaded = min(self.history_limit, total)
+        control = self.query_one("#load-older", Button)
+        control.disabled = loaded >= total
+        if self.search_query:
+            control.label = (f"↑ More matches · {loaded}/{total}" if loaded < total
+                             else f"✓ Search results · {total}")
+        else:
+            control.label = (f"↑ Load older · {loaded}/{total}" if loaded < total
+                             else f"✓ All history · {total}")
+
+    @staticmethod
+    def _day_marker(timestamp: int) -> tuple[tuple[int, int], Text]:
+        local = time.localtime(timestamp)
+        label = time.strftime("%A · %B", local) + f" {local.tm_mday}"
+        return (local.tm_year, local.tm_yday), Text(
+            f"────  {label}  ────", style="bold #718096")
+
+    @staticmethod
+    def _append_body_text(target: Text, value: str,
+                          style: Style | str | None = "#d9e1ec") -> None:
+        position = 0
+        for mention in MENTION_RE.finditer(value):
+            target.append(value[position:mention.start()], style=style)
+            target.append(mention.group(0), style="bold #f9d56e")
+            position = mention.end()
+        target.append(value[position:], style=style)
+
+    @classmethod
+    def _render_inline_text(cls, body: str) -> Text:
+        rendered = Text()
+        position = 0
+        for token in INLINE_TOKEN_RE.finditer(body):
+            cls._append_body_text(rendered, body[position:token.start()])
+            kind = token.lastgroup
+            raw = token.group(0)
+            if kind == "link":
+                link = re.fullmatch(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", raw)
+                if link:
+                    target = link.group(2).rstrip(".,!?;:")
+                    suffix = link.group(2)[len(target):]
+                    rendered.append(link.group(1), style=Style(
+                        color="#a9b6ff", underline=True, link=target))
+                    cls._append_body_text(rendered, suffix)
+                else:
+                    cls._append_body_text(rendered, raw)
+            elif kind == "url":
+                target = raw.rstrip(".,!?;:")
+                rendered.append(target, style=Style(
+                    color="#a9b6ff", underline=True, link=target))
+                cls._append_body_text(rendered, raw[len(target):])
+            elif kind == "code":
+                rendered.append(raw[1:-1], style="#f3ce82 on #202b3b")
+            elif kind == "bold":
+                cls._append_body_text(rendered, raw[2:-2], "bold #d9e1ec")
+            elif kind == "underline":
+                cls._append_body_text(rendered, raw[2:-2], "underline #d9e1ec")
+            elif kind == "strike":
+                cls._append_body_text(rendered, raw[2:-2], "strike #8a98ae")
+            elif kind in {"italic", "italic_underscore"}:
+                cls._append_body_text(rendered, raw[1:-1], "italic #d9e1ec")
+            position = token.end()
+        cls._append_body_text(rendered, body[position:])
+        return rendered
+
+    @classmethod
+    def _render_inline_body(cls, body: str) -> Text:
+        rendered = Text()
+        for line in body.splitlines(keepends=True):
+            content = line[:-1] if line.endswith("\n") else line
+            newline = "\n" if line.endswith("\n") else ""
+            heading = re.match(r"^(#{1,3}) +(.*)$", content)
+            quote = re.match(r"^> ?(.*)$", content)
+            bullet = re.match(r"^[*-] +(.*)$", content)
+            numbered = re.match(r"^(\d+[.)]) +(.*)$", content)
+            if heading:
+                rendered.append(heading.group(1) + " ", style="#7566ad")
+                heading_start = len(rendered.plain)
+                rendered.append_text(cls._render_inline_text(heading.group(2)))
+                heading_style = {"#": "bold #d8ccff", "##": "bold #c4b5fd",
+                                 "###": "bold #b4a7d6"}[heading.group(1)]
+                rendered.stylize(heading_style, heading_start, len(rendered.plain))
+                for mention in MENTION_RE.finditer(rendered.plain, heading_start):
+                    rendered.stylize("bold #f9d56e", mention.start(), mention.end())
+            elif quote:
+                rendered.append("│ ", style="#718096")
+                quoted = cls._render_inline_text(quote.group(1))
+                quoted.stylize("italic", 0, len(quoted.plain))
+                rendered.append_text(quoted)
+            elif bullet:
+                rendered.append("• ", style="#79d7b2")
+                rendered.append_text(cls._render_inline_text(bullet.group(1)))
+            elif numbered:
+                rendered.append(numbered.group(1) + " ", style="#79d7b2")
+                rendered.append_text(cls._render_inline_text(numbered.group(2)))
+            else:
+                rendered.append_text(cls._render_inline_text(content))
+            rendered.append(newline)
+        return rendered
+
+    @classmethod
+    def _render_message_body(cls, body: str) -> list[Text | Syntax]:
+        pieces: list[Text | Syntax] = []
+        position = 0
+        for block in FENCED_CODE_RE.finditer(body):
+            before = body[position:block.start()]
+            if before:
+                before = before[:-1] if before.endswith("\n") else before
+                if before:
+                    pieces.append(cls._render_inline_body(before))
+            language = block.group("language") or "text"
+            try:
+                get_lexer_by_name(language)
+            except ClassNotFound:
+                language = "text"
+            code = block.group("code").rstrip("\r\n")
+            pieces.append(Syntax(code, language, theme="monokai", word_wrap=True,
+                                 line_numbers=False))
+            position = block.end()
+            if body[position:position + 1] == "\n":
+                position += 1
+        tail = body[position:]
+        if tail:
+            pieces.append(cls._render_inline_body(tail))
+        if not pieces:
+            pieces.append(cls._render_inline_body(body))
+        return pieces
+
+    def _message_renderable(self, message: dict):
+        stamp = time.strftime("%H:%M", time.localtime(int(message["ts"])))
+        local = message["o"] == self.chat.store.node
+        text = Text()
+        text.append(f"{stamp}  ", style="#718096")
+        text.append(message["n"], style="bold #c4b5fd" if local else "bold #8bd5ca")
+        text.append("  ", style="#65748b")
+        body = str(message["b"])
+        parts: list[Text | Syntax] = [text]
+
+        def highlight_search(body_part: Text) -> None:
+            if self.search_query:
+                for match in re.finditer(re.escape(self.search_query), body_part.plain,
+                                         re.IGNORECASE):
+                    body_part.stylize("bold #f9d56e", match.start(), match.end())
+
+        first_body_part = True
+        for body_part in self._render_message_body(body):
+            if isinstance(body_part, Text):
+                highlight_search(body_part)
+                if first_body_part:
+                    text.append_text(body_part)
+                else:
+                    parts.append(body_part)
+            else:
+                parts.append(body_part)
+            first_body_part = False
+
+        footer = Text()
+
+        def append_footer(value: str, style: Style | str) -> None:
+            footer.append("\n          " if footer.plain else "          ", style="#718096")
+            footer.append(value, style=style)
+
+        if local:
+            receipts = self.chat.store.receipts_for(message["o"], message["s"])
+            mentions = [mention_name(match) for match in MENTION.finditer(body)]
+            if mentions:
+                states = []
+                for mention in mentions:
+                    stations = sorted({station for station, alias in receipts
+                                       if alias.casefold() == mention.casefold()})
+                    label = format_mention(mention)
+                    states.append(f"✓ {label} · {', '.join(stations)}" if stations
+                                  else f"… {label}")
+                color = "#79d7b2" if all(state.startswith("✓") for state in states) else "#d2ae67"
+                append_footer("  ·  ".join(states), color)
+        auth = self.chat.store.auth_for(message["o"], message["s"])
+        if auth["status"] == "verified":
+            append_footer(f"✓ Verified · {auth['signer']}", "bold #79d7b2")
+        elif auth["status"] == "signing_failed":
+            append_footer("! Sent unsigned · ARAP signing failed; will retry", "bold #ffb86c")
+        elif auth["status"] == "pending":
+            append_footer("⟳ Signature pending", "#a9a0d0")
+        elif auth["status"] == "untrusted":
+            append_footer(f"◌ Signed · {auth['signer']} · key not trusted", "#d2ae67")
+        elif auth["status"] == "unverified":
+            append_footer(f"◌ Signature unchecked · claimed signer {auth['signer']}",
+                          "#d2ae67")
+        elif auth["status"] == "invalid":
+            append_footer("! Signature invalid", "bold #ff7d84")
+        attachment = message.get("image") or self.chat.store.attachment_for(
+            message["o"], int(message["s"]))
+        thumbnail = self.chat.store.image_for(attachment["digest"]) if attachment else None
+        if attachment and not thumbnail:
+            append_footer(f"▧ Thumbnail · {attachment['width']}×{attachment['height']} · "
+                          "select it in Recent Images to request", "#8a98ae")
+        if footer.plain:
+            parts.append(footer)
+        if thumbnail:
+            parts.append(render_thumbnail(thumbnail))
+        return parts[0] if len(parts) == 1 else Group(*parts)
+
+    def _drain_events(self) -> None:
+        # Textual may run an already-scheduled interval once while the app is
+        # being detached. The screen is no longer available for UI updates.
+        if not self.is_mounted:
+            return
+        changed_channels = False
+        image_progress_changed = False
+        while True:
+            try:
+                event, value = self.chat.events.get_nowait()
+            except queue.Empty:
+                break
+            if event == "message":
+                if value["c"] == self.channel:
+                    if self.search_query:
+                        self._load_messages()
+                    else:
+                        identity = (value["o"], int(value["s"]))
+                        if identity not in self.displayed_messages:
+                            feed = self.query_one("#messages", RichLog)
+                            day, marker = self._day_marker(int(value["ts"]))
+                            if day != self.displayed_day:
+                                feed.write(marker)
+                                self.displayed_day = day
+                            feed.write(self._message_renderable(value))
+                            self.displayed_messages.add(identity)
+                else:
+                    channel = value["c"]
+                    unread = self.chat.store.unread_summary(channel)
+                    if unread:
+                        self.unread[channel] = int(unread[0]["messages"])
+                        self.unread_mentions[channel] = int(unread[0]["mentions"] or 0)
+                    else:
+                        self.unread.pop(channel, None)
+                        self.unread_mentions.pop(channel, None)
+                changed_channels = True
+                self._refresh_images()
+                self._refresh_stats()
+            elif event == "receipt":
+                self._load_messages()
+                self.query_one("#messages", RichLog).write(
+                    Text(f"✓ {format_mention(value['m'])} received by {value['n']}  ·  "
+                         f"message #{value['s']}",
+                         style="bold #79d7b2"))
+                self.last_status = f"{format_mention(value['m'])} received by {value['n']}"
+                self.query_one("#activity", Static).update(self.last_status)
+            elif event == "auth":
+                self._load_messages()
+                if value["status"] == "verified":
+                    self.last_status = f"Verified message from {value['signer']}"
+                elif value["status"] == "invalid":
+                    self.last_status = "Message signature failed verification"
+                elif value["status"] == "unverified":
+                    self.last_status = (f"Signature from {value['signer']} could not be checked")
+                elif value["status"] == "signing_failed":
+                    self.last_status = "Message sent unsigned; ARAP signing failed and will retry"
+                else:
+                    self.last_status = f"Signature from {value['signer']} is not trusted"
+                self.query_one("#activity", Static).update(self._short_status(self.last_status))
+            elif event == "auth-policy":
+                self._load_messages()
+                count = int(value.get("count", 0))
+                self.last_status = f"ARAP policy changed; checking {count} signed messages"
+                self.query_one("#activity", Static).update(self._short_status(self.last_status))
+            elif event in {"image", "attachment"}:
+                self._load_messages()
+                if event == "image":
+                    self.last_status = "Requested thumbnail received"
+                    self.query_one("#activity", Static).update(self.last_status)
+            elif event == "image-progress":
+                image_progress_changed = True
+            elif event == "refresh":
+                # The bounded async event buffer overflowed. Rebuild the view
+                # from SQLite, which is the durable source of message state.
+                self._load_messages()
+                self.chat.store.clear_unread(self.channel)
+                self.unread.clear()
+                self.unread_mentions.clear()
+                for unread in self.chat.store.unread_summary():
+                    if unread["c"] != self.channel:
+                        self.unread[unread["c"]] = int(unread["messages"])
+                        self.unread_mentions[unread["c"]] = int(unread["mentions"] or 0)
+                changed_channels = True
+                self._refresh_images()
+                self._refresh_stats()
+                self.last_status = "Event backlog coalesced; refreshed from stored history"
+                self.query_one("#activity", Static).update(self._short_status(self.last_status))
+            elif event == "status":
+                self.last_status = str(value)
+                self.query_one("#activity", Static).update(self._short_status(str(value)))
+                if (str(value).startswith("Connected to Data2G") or
+                        str(value).startswith("Connected to raw KISS")):
+                    self.query_one("#link-detail", Static).update(self._link_detail())
+                status = str(value).lower()
+                link_state = self.query_one("#link-state", Static)
+                if self.chat.args.transport == "connected":
+                    if status.startswith("arq connected"):
+                        link_state.update("● ARQ CONNECTED")
+                    elif status.startswith("arq disconnected"):
+                        link_state.update("● LISTENING")
+                    elif status.startswith("connected to data2g"):
+                        link_state.update("● LISTENING")
+                    elif (status.startswith("data2g disconnected") or
+                          status.startswith("data2g connection failed") or
+                          "connection closed" in status or "connection error" in status or
+                          "retrying" in status):
+                        link_state.update("● RECONNECTING")
+                elif "disconnected" in status or "closed" in status or "error" in status or "retrying" in status:
+                    link_state.update("● RECONNECTING")
+                elif status.startswith("connected to data2g"):
+                    link_state.update("● ONLINE")
+                elif status.startswith("connected to raw kiss"):
+                    link_state.update("● ONLINE")
+        if changed_channels:
+            self._refresh_channels()
+        if image_progress_changed:
+            self._refresh_images()
+        self._refresh_stations()
+
+    def _short_status(self, value: str) -> str:
+        return value if len(value) <= 72 else value[:69] + "…"
+
+    def _link_detail(self) -> str:
+        if self.chat.args.transport == "ax25":
+            path = ",".join(self.chat.data.digipeaters) or "direct"
+            return (f"{self.chat.args.host}:{self.chat.data.kiss_port}\n"
+                    f"AX.25 UI · {self.chat.args.callsign} → "
+                    f"{self.chat.data.ax25_destination} · {path}")
+        control = f"{self.chat.args.host}:{self.chat.data.command_port}"
+        if self.chat.args.transport == "broadcast":
+            return f"{control}\nKISS port {self.chat.data.port}"
+        return (f"{control}\nVARA data {self.chat.data.command_port + 1} · "
+                f"{self.chat.data.bandwidth} Hz cap")
+
+    def _mention_targets(self) -> list[str]:
+        values = {self.chat.args.callsign, self.chat.nick, *self.chat.station_names()}
+        unique = {}
+        for name in values:
+            if valid_mention_name(name):
+                unique.setdefault(name.casefold(), name)
+        return sorted(unique.values(), key=str.casefold)
+
+    def _connect_targets(self) -> list[str]:
+        if self.chat.args.transport != "connected":
+            return []
+        own_call = self.chat.args.callsign.casefold()
+        return sorted({callsign for _, callsign in self.chat.station_labels()
+                       if callsign.casefold() != own_call}, key=str.casefold)
+
+    def _refresh_stations(self) -> None:
+        stations = self.chat.station_labels()
+        content = ("\n".join(f"●  {escape(nick)} · {escape(callsign)}"
+                            if nick.casefold() != callsign.casefold()
+                            else f"●  {escape(callsign)}"
+                            for nick, callsign in stations)
+                   if stations else "Listening for stations…")
+        try:
+            self.query_one("#station-list", Static).update(content)
+        except NoMatches:
+            # The interval can fire after Textual has removed the base screen
+            # during shutdown. There is no station panel to update then.
+            return
+
+    def _refresh_images(self) -> None:
+        self.images = self.chat.store.recent_attachments(self.channel)
+        listing = self.query_one("#image-list", OptionList)
+        listing.clear_options()
+        options = []
+        for index, image in enumerate(self.images):
+            stamp = time.strftime("%H:%M", time.localtime(int(image["ts"])))
+            cached = self.chat.store.image_for(image["digest"]) is not None
+            if cached:
+                state = "✓"
+            else:
+                received, total = self.chat.store.image_progress(
+                    image["origin"], int(image["seq"]))
+                state = f"↻ {received}/{total}" if received else "↓"
+            label = (f"{state}  {escape(str(image['nick']))} · {stamp} · "
+                     f"{image['width']}×{image['height']}")
+            options.append(Option(label, id=f"image-{index}"))
+        listing.add_options(options)
+        if options:
+            listing.highlighted = min(listing.highlighted or 0, len(options) - 1)
+        request = self.query_one("#request-image", Button)
+        request.disabled = not options
+        request.label = "↓  Request selected"
+
+    def _refresh_stats(self) -> None:
+        count = self.chat.store.message_count()
+        peers = self.chat.station_count()
+        self.query_one("#sync-card", Static).update(
+            f"{count:,} messages · {peers} station{'s' if peers != 1 else ''}\n"
+            "Forwarding history nearby")
+
+
+FENCED_CODE_RE = re.compile(
+    r"(?m)^```(?P<language>[A-Za-z0-9_+#.-]{0,32})[ \t]*\r?\n"
+    r"(?P<code>.*?)^```[ \t]*$", re.DOTALL)
+INLINE_TOKEN_RE = re.compile(
+    r"(?P<link>\[[^\]\n]{1,200}\]\(https?://[^)\s]+\))"
+    r"|(?P<code>`[^`\n]+`)"
+    r"|(?P<url>https?://[^\s<>\]]+)"
+    r"|(?P<bold>\*\*[^*\n]+\*\*)"
+    r"|(?P<underline>__[^_\n]+__)"
+    r"|(?P<strike>~~[^~\n]+~~)"
+    r"|(?P<italic>\*[^*\n]+\*)"
+    r"|(?P<italic_underscore>(?<!\w)_[^_\n]+_(?!\w))"
+)

@@ -1,0 +1,10 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --contention-window 10 --time-scale 0.1 --script fixtures/message_bundling.txt
+burst A 8 packet airtime test
+wait 3
+verify-bundling
+sync C A
+wait 15
+history C
+verify
+stats
+quit

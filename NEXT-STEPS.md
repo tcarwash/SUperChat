@@ -1,0 +1,455 @@
+# SUperChat next steps and acceptance plan
+
+Planning baseline: 2026-10-20. This is a proposed implementation and validation
+sequence, not a record of completed tests. No tests or RF transmissions were
+performed for this planning pass.
+
+## Current baseline
+
+The checkout implements channels, SQLite history, broadcast gossip and bounded
+relaying, a 48-hour sync window, mention delivery receipts, requested thumbnails,
+compressed record batching, Data2G broadcast/connected transport, and raw KISS
+AX.25 UI transport. A standalone binary build and Compose relay configuration
+exist. Simulator fixtures cover several of these paths.
+
+The presence of code or a fixture does not establish reliable RF behavior.
+The image dialog now has headless Textual interaction coverage across four
+terminal sizes, including path/caption submission and visible error behavior.
+Ghostty file-drop delivery and the native Browse chooser still need live
+reproduction. Ghostty supports file drops in some configurations; the earlier
+blanket claim that it cannot deliver paths to terminal applications is not
+established.
+
+ARAP integration already exists in `kisschat/auth.py`: canonical JSON content,
+CLI signing/verification, detached proof transport, storage and repair, and status
+badges. Known boundaries visible in source:
+
+- `Chat.publish()` sends message bodies before asynchronous signing; this is
+  intentional because signing is optional and must never gate delivery.
+- The ARAP adapter now uses `inspect-proof` for untrusted signer/fingerprint
+  claims, prefers fingerprint-addressed public keys, and requires all structured
+  verification fields plus verified claims to agree before showing Verified.
+- Fingerprint-addressed lookup has a callsign filename fallback for existing
+  setups; explicit trust revision and key lifecycle UI are still missing.
+- Verification caches now include a local verifier/profile/key/trust revision.
+  Trust changes invalidate prior decisions immediately and queue stored proofs
+  for rechecking; pending signatures show an explicit checking state.
+- Mention receipts are currently unauthenticated application records.
+- ARAP must be installed separately; the default container does not include it.
+
+## Progress log
+
+- Added a Textual interaction regression for the actual image attachment modal.
+  At 48×24, 80×24, 100×30 and 160×45 it checks both action labels and that
+  their rendered regions remain inside the screen; it also exercises path Enter,
+  caption Enter and Escape. An integration check through `ChatApp` proves an
+  explicit path submit queues one image operation, while a missing path produces
+  a visible error with no stored message or transport frame. These checks pass.
+  They do not reproduce Ghostty file-drop delivery or launch the native Browse
+  chooser, which remain open.
+- The complete current unittest suite passes: 16 tests, including auth policy,
+  optional-signing delivery and restart recovery, loss model, local-history
+  purge, image-dialog checks and shared SUperChat/ARAP profile vectors. These are
+  source-level and headless Textual checks, not a live terminal-emulator or RF
+  acceptance run.
+- Fixed a Textual event-timer teardown race that appeared when the full test
+  suite ran after the image-dialog tests: the station-panel refresh now tolerates
+  a late timer callback after Textual removes the screen widgets. The complete
+  16-test suite passes with the image tests included.
+- Added a deterministic simulator fault for one requested image chunk on B→C.
+  `fixtures/requested_thumbnail_loss.txt` confirmed metadata/history sync sent
+  no image bytes before C's request, dropped chunk 0 of 3, then retried exactly
+  that missing chunk through B. C reconstructed the original thumbnail digest,
+  and all stations retained matching message histories. The JSON report passed;
+  this does not yet cover competing image caches.
+- Added `fixtures/offline_origin_thumbnail_relay.txt`. B requests and stores A's
+  thumbnail, then A's simulator process, database connection and radio receiver
+  stop. C syncs A's message metadata through B, verifies B has the complete image
+  while C has no image bytes, then requests and receives the exact thumbnail
+  from B. `/tmp/kisschat-offline-thumbnail.json` passed with A stopped and all
+  three durable message histories converged. This validates the simulator's
+  store-and-forward path, not RF behavior.
+- Tightened the lost history page-end check so it measures the actual retry:
+  C's manifest-only query must occur after the page-end is dropped, and B must
+  send zero message fragments after that retry. The loss-free line fixture now
+  passes with all three message stores converged; `/tmp/kisschat-lost-page-end.json`
+  records the dropped page-end, observed manifest retry and zero post-retry data
+  fragments. This is simulated transport evidence, not a modem ACK or RF test.
+- Added a deterministic delayed page-end response in the frame-level simulator.
+  `fixtures/delayed_history_page_end.txt` partitions B from C while A sends a
+  3,000-byte message, then reconnects C and delays B's completion frame for 10
+  simulated seconds. C receives all 19 message fragments, retries with a
+  manifest-only query, and gets completion without another message fragment;
+  both the retry and delayed completion arrive and all histories converge.
+  `/tmp/kisschat-delayed-page-end.json` passed. This exercises the application
+  page-end response, not KISS TNC ACKMODE or modem-level delayed ACKs.
+- Added `fixtures/restart_all_stations.txt`. A publishes an unsigned message,
+  then A, B and C are each stopped and restarted from their SQLite databases.
+  The fixture checks process/radio detachment, durable node identity and the
+  original message at A, then explicitly syncs C after restart and confirms all
+  three histories converge. `/tmp/kisschat-restart-all.json` passed with one
+  restart per station. This does not exercise restarting physical modems.
+- Added `scripts/run_signed_mesh.py`, which creates temporary encrypted ARAP
+  keys and a disposable local trust store, then runs the real SUperChat cores
+  over the three-station line simulator. `fixtures/signed_history_relay.txt`
+  passed: A's 309-byte proof crossed B to C, all three clients reported
+  `verified`, and the stored proof bytes matched exactly. The machine report
+  includes per-station verification status and proof size. The run used zero
+  configured packet loss; its two-fragment proof produced 4/6/4 outgoing proof
+  fragments at A/B/C, so duplicate/repair overhead still needs measurement. A
+  remained online for this loss-free run; the separate proof-loss fixture below
+  covers repair with A radio-isolated. No production keys or RF were used.
+- Suppressed needless proof-page requests after a message page completes when
+  every message on that page already has its complete proof stored. The real
+  signed A→B→C fixture still verifies at all three stations; compared with the
+  prior same-seed run, B's transmitted proof-fragment records fell from 6 to 4
+  for this two-fragment proof, and the observed proof-page request count fell
+  from 2 to 1. The deterministic lost-proof-fragment fixture still repaired the
+  missing proof byte-for-byte without replaying the body. Exact airtime remains
+  scheduler-sensitive; no RF result is implied.
+- Added a real-ARAP process-stop proof-loss fixture: A signed a message while
+  B↔C was partitioned, B stored and verified it, and the simulator stopped A's
+  Chat, database connection and radio receiver before C requested A's history
+  through B. C started with neither body nor proof. The fixture dropped B→C
+  proof fragment 0; C received the body, requested proofs only, recovered
+  byte-identical proof bytes from B, and verified K0AAA without body replay. A
+  then restarted with the same database identity and trusted proof. The JSON
+  report records A stopped/restarted, an offline-origin sync, a verified signed
+  proof at C and no body replay. A separate unsigned fixture now restarts all
+  three Chat processes and reconverges after an explicit sync. Modem restart and
+  RF remain untested.
+- Added deterministic detached-proof loss to the line simulator. The fixture
+  transfers an opaque 760-byte proof from A to B while B↔C is partitioned,
+  drains and verifies the relay cache, then drops one B→C proof fragment during
+  C's history sync. The proof-only page restores identical bytes, and the check
+  confirms no message-body replay. Its JSON report records the dropped index,
+  repair-page counters and restored-byte result: chunk 0 dropped, 3 partial
+  chunks at the proof-page request, 4 retransmitted, 7 total at C, and no body
+  replay. This validates transport and storage only; it does not use a
+  cryptographically valid ARAP proof.
+- Added `/clear-history` with a confirmation dialog. It purges local messages,
+  image cache, receipts and partial transfers, clears in-memory sync retry state,
+  and preserves the station identity and sequence counter. The dialog explains
+  that other stations' copies cannot be erased and may later sync back. Focused
+  storage validation checks inventory is empty after purge and the next local
+  message uses a fresh sequence.
+- Image-dialog snapshots show readable button labels at 48×24, 80×24, 100×30
+  and 160×45. A focused Textual interaction check confirms Enter in the path
+  field submits the selected path. These are rendered UI checks, not a live
+  Ghostty or native desktop chooser test.
+- Signing remains optional and never blocks sending. SUperChat now persists an
+  asynchronous signing failure, shows that the message was sent unsigned, and
+  includes the failed proof in the existing retry query. Real CLI signing and
+  verification work; unavailable-key behavior still needs an integration check.
+- Added a close/reopen recovery regression for both interrupted signing and a
+  persisted signing failure. The next explicit sync retry queues only proof work
+  for the original message identities; it does not send message bodies again.
+  A completed proof remains queryable after another restart, while a failed
+  proof remains retryable. The full 16-test SUperChat suite passes. This is a
+  Store/retry-path test with a fake signer queue; real key outage and over-air
+  proof delivery recovery remain open.
+- Verification now consumes ARAP's untrusted `inspect-proof` JSON and structured
+  `verify-content` result. Three focused unit tests cover accepted, untrusted and
+  incomplete results. A temporary real-CLI run generated an encrypted key,
+  signed a SUperChat message, trusted the key and verified the proof successfully;
+  its key and trust store were removed afterward.
+- Began freezing `KISSChat-message-v1` in
+  `docs/ARAP-CONTENT-PROFILE.md` and `../arap/docs/KISSCHAT-INTEGRATION.md`.
+  Both projects now define the same bounded JSON profile and media/context IDs;
+  the ARAP Go adapter independently emits the Python canonical bytes. Shared
+  golden vectors cover Unicode multiline text, an empty-caption JPEG thumbnail,
+  and uint32 sequence/timestamp edges. Boundary checks include the maximum
+  4,096-byte body. Python's full 15-test suite and all ARAP Go package tests
+  pass. The real ARAP CLI signed and trusted-verified a SUperChat profile
+  message with a disposable encrypted key. Changing the signed body returned
+  `content_mismatch` and `invalid`. A separate real-CLI A→B→C line run verified
+  the identical 309-byte detached proof at all three stations. Signed loss
+  repair, A-offline recovery and RF signing equivalence remain open.
+- Trust-policy changes are now polled every two seconds, persisted as a
+  verification revision, and invalidate previous proof decisions in one SQLite
+  transaction. Proof bytes remain stored; old in-flight jobs cannot restore a
+  result from the previous revision. A regression check confirms body frames
+  are queued before a full signing queue can refuse the optional proof job.
+  Six focused adapter/store/delivery tests pass.
+- The mesh simulator now supports temporary symmetric link partitions and
+  rejoining. `fixtures/partition_rejoin.txt` verified that A's message stayed
+  isolated from B during the outage, then reached B and C through the relay
+  after reconnection. This uses the virtual radio model only, not RF.
+- Scripted simulation can now write JSON results with run configuration, check
+  names, current links, per-station counters and stored message rows. The
+  partition/rejoin report was parsed and confirmed `passed: true`, matching
+  message identities at all stations, with 12/13/9 frames transmitted. A report
+  run with no verification command is treated as failure.
+- Added an asymmetric A/B/C topology where C hears A directly but A cannot hear
+  C. The fixture proved A's message reached B and C, C's response reached B,
+  and A did not receive C's message. Its JSON report passed with nonzero frame
+  counts from every station.
+- Added `scripts/run_loss_matrix.py` and a targeted history-repair fixture. The
+  seeded 0%, 5%, 15% and 30% line-topology matrix now passes with real SUperChat
+  instances and JSON/database output. At 30%, the initial attempt exposed that
+  B can miss A's first announcement; explicitly re-announcing A's inventory and
+  repeating C's request lets the configured retry budget converge. Two further
+  30% runs both converged, though host thread scheduling changed exact counters.
+  Backoff and loss draws now use separate per-station/per-link seeded streams;
+  collision and retry timing are still scheduler-sensitive.
+- The receive-only fixture also reports `passed: true` with an explicit
+  `verify-quiet` check and zero frames, so intentional quiet-start checks remain
+  distinct from scenarios that must exchange messages.
+- The bursty-loss runner now passed at 5%, 15% and 30% on the line fixture; the
+  saved JSON report records the selected Gilbert-Elliott parameters and each
+  run's exit/pass state. A deterministic requested-image-chunk drop also
+  converged through selective repair, and opaque detached-proof repair now
+  passes without body replay. ARAP-valid signed-proof behavior under loss,
+  lost inventory announcements and modem-level delayed ACKs remain open; the
+  application page-end delay and retry path now pass separately.
+
+## 1. Stabilize the operator workflow
+
+Deliver a reliable image dialog and basic chat navigation before RF trials.
+
+- Reproduce the image dialog at 80×24, 100×30 and 160×45, plus a narrow terminal.
+  Inspect rendered labels and clipping, including focus/hover states.
+- Exercise keyboard and mouse selection, path Enter, caption Enter, Browse,
+  cancel/Escape, spaces/quotes/file URIs, missing files and invalid images.
+- Make preparation, local storage, queueing, transport failure and retry visible
+  near the composer, including layouts where the activity rail is hidden.
+- Confirm choosing a file never transmits; explicit Enter/Send commits it.
+  Verify thumbnail bytes remain local until requested by a receiver.
+- Diagnose Ghostty separately with a shell drop and app input capture. Support
+  the actual emitted path format; document terminal-specific limitations only
+  after reproducing them.
+- Verify per-channel drafts and unread/mention badges through channel switches,
+  restart where persistence is promised, and incoming history updates.
+
+Acceptance: no invisible controls, no silent failure, and one explicit submit
+creates exactly one local attachment message. Record screenshots and the terminal
+version used. Use an isolated database and fake transport for UI checks.
+
+## 2. Complete optional ARAP message signing
+
+Use the existing sibling `../arap` implementation as the cryptographic and
+policy authority. Keep SUperChat's adapter responsible for chat content, transport
+and UI. Do not introduce a separate signing algorithm or independent trust model.
+
+### 2a. Freeze the content contract
+
+- [partial] Document a versioned SUperChat content profile in both projects: origin UUID,
+  sequence, timestamp, channel, nick, signing callsign, exact body, and optional
+  thumbnail digest, dimensions, byte count and media type.
+- [partial] Specify exact UTF-8 serialization, integer bounds, absent versus empty fields,
+  Unicode handling and context/media-type identifiers. Preserve signed bytes;
+  relay TTL, receive time and route are excluded.
+- [partial] Separate RF callsign/SSID from signing identity. For example, explicitly bind
+  transport `AG7SU-7` to signing identity `AG7SU`; never silently strip arbitrary
+  identifiers or claim that a signature authenticates the immediate RF relay.
+- Add independent Python/Go golden vectors for text, Unicode, multiline text,
+  empty-caption images and boundary-size messages. Reject wrong profile/context,
+  identity, channel, sequence, body and image metadata.
+
+Acceptance: the real ARAP CLI accepts the agreed byte stream; every signed-field
+mutation fails the appropriate integrity or policy check.
+
+### 2b. Best-effort outgoing signing
+
+- Sending is never gated on ARAP setup or success. With no key, send immediately
+  as unsigned. With a key, send the message immediately and sign asynchronously;
+  attach and relay the proof when it is ready.
+- Missing key, wrong passphrase, unavailable CLI, saturated worker queue or
+  signing failure must leave the message sent and clearly marked unsigned or
+  signing failed. Offer an explicit retry for the proof without replaying the
+  body or creating another sequence number.
+- [partial] Recover interrupted proof generation and proof delivery independently after
+  restart; prevent duplicate message identities and preserve receive-only
+  interactive startup. Store/retry recovery now covers pending and failed local
+  signing after restart on the next explicit or automatic sync, without replaying
+  the message body. Durable proof delivery through modem disconnect/restart still
+  needs transport-level integration coverage. A pending proof must never make an
+  already sent message disappear from history or block other chat traffic.
+- Unlock encrypted keys through a deliberate user flow; pass secrets through
+  ARAP's supported stdin mechanism. Keep secrets out of arguments, logs and the
+  database. Define headless secret handling and session lock behavior.
+- Measure CLI startup and encrypted-key unlock cost. If repeated invocation is
+  too expensive, extend ARAP with a bounded local signing service using its Go
+  library, explicit unlock/lock and restricted local access; do not duplicate
+  private-key handling in SUperChat.
+
+Acceptance: sends complete immediately with ARAP absent or failing; successful
+proofs later verify over a real ARAP CLI. Recovery never resends a body solely
+because proof creation or proof delivery was interrupted, and no recovery task
+keys an interactive station on initial startup.
+
+### 2c. Verification and key lifecycle
+
+- [x] Replace the handwritten CBOR claim parser with ARAP's bounded
+  `inspect-proof` interface. Inspected claims remain untrusted until verification
+  succeeds.
+- Consume structured verification results: cryptographic signature, content
+  integrity, callsign identity, overall policy and reason. `Verified` requires
+  valid signature/content and accepted callsign policy for the expected purpose.
+- Expose unsigned, proof pending, unknown key, signed/untrusted, trusted,
+  rejected/disabled, expired and invalid states without conflating them.
+- [partial] Prefer keys by full fingerprint and maintain ARAP-managed explicit
+  callsign/purpose bindings. Add import/export, fingerprint review, rotation,
+  disabling and multiple historical keys in the operator workflow; use ARAP
+  trust commands for trust changes.
+- [partial] Include proof/content hashes, verifier/profile/key version and
+  trust-store revision in verification cache keys. Trust changes now trigger
+  durable revalidation across restart; relevant time-policy boundaries still
+  need scheduling and cache coverage.
+- Show why a badge is trusted: signer, fingerprint, verification time and trust
+  source. Local manual trust must not be represented as independently established
+  licensing identity.
+- Optional keyserver lookup may retrieve fingerprint-addressed public keys, with
+  bounded fetches and hash checks. Retrieval never creates trust. Offline key
+  import and complete offline verification remain first-class paths.
+
+Acceptance: disabling a trusted key removes its current verified status without
+restarting; rotation preserves old proofs and selects the correct historical key;
+malformed or unavailable verifier output cannot produce a verified badge.
+
+### 2d. Proof transport, images and authenticated receipts
+
+- [partial] Preserve original proof bytes through live receive, history batches, relay
+  storage, restart and fragment repair. Handle proof/body/metadata arrival in
+  any order without premature verification or permanent false-invalid status.
+  A real-ARAP A→B→C proof crossed the line and verified byte-identically; proof
+  loss repair with A's process stopped now passes, including one dropped proof
+  fragment and a proof-only repair from B. Restart of every station, modem
+  restart, and arbitrary arrival-order coverage remain open.
+  History completion now skips proof-page requests when all page proofs are
+  already stored; live/in-flight proof races still need broader coverage.
+- Apply explicit proof size, fragment, retry and queue limits. Fit the actual
+  ARAP profile into transport limits and reject oversize proofs visibly.
+- Keep proofs with messages by default so verification works without Internet.
+  Measure their airtime cost before introducing optional reference-only schemes.
+- Verify requested thumbnail bytes against the signed digest before displaying
+  them as authenticated content; distinguish signed metadata from received bytes.
+- Define a separate versioned ARAP content context for delivery receipts binding
+  the original message digest/identity, recipient identity and receipt time.
+  Persist and relay receipt proofs. Display verified delivery only for an accepted
+  recipient signature; unsigned receipts remain visibly unauthenticated.
+- Prevent forged receipt confirmations from retiring authenticated pending
+  receipts. Bind confirmations to exact receipts and authenticate them in the
+  signed-receipt flow, with bounded retry and expiry behavior.
+- Authenticated content does not authenticate inventory, routing or immediate
+  RF peers. Keep bounded control traffic; station challenge-response can be a
+  separate later feature if peer authentication is needed.
+
+Acceptance: signed text, images and receipts survive A→B→C with A offline;
+tampering, proof stripping and spoofed receipts never gain trusted status.
+
+### 2e. Integration and packaging
+
+- Build against a recorded ARAP revision and exercise the real CLI, rather than
+  mocking all sign/verify calls. Add vectors and integration coverage to both
+  projects where the profile boundary requires it.
+- Ship an ARAP-enabled standalone distribution and Compose image, with explicit
+  executable discovery, version diagnostics, key/trust mounts and setup guidance.
+  Verify encrypted-key signing as the container's unprivileged user.
+- ARAP's experimental LoTW enrollment is not a prerequisite for local-trust
+  message signing. Integrate enrolled identity only when ARAP's own validation
+  and policy gates are satisfied; retain accurate trust provenance in the UI.
+
+## 3. Repeatable mesh and transport validation
+
+Extend the existing simulator into a repeatable suite with machine-readable
+results, per-record traces, database comparisons and an overall failure exit code.
+
+- [partial] Run full mesh and A—B—C line scenarios. Partition/rejoin,
+  directional asymmetric-hearing fixtures and a bursty-loss line run at 5%,
+  15% and 30% now pass.
+- [partial] The seeded independent-loss 0%, 5%, 15% and 30% line-topology
+  matrix and bursty-loss 5%, 15% and 30% line matrix pass. Exact counters can
+  vary with host thread scheduling. Deterministic requested-thumbnail loss
+  proves selective repair and digest completion; opaque proof loss proves
+  proof-only repair without body replay; lost history page-end retry proves a
+  manifest-only response without fragment replay; and real ARAP CLI runs verify
+  byte-identical proofs at A, B and C, including a dropped proof fragment
+  repaired while A's process is stopped. Offline-origin thumbnail relay,
+  delayed application page-end recovery and restart/reconvergence of all three
+  Chat processes pass. Modem-level ACKMODE behavior and restart, and competing
+  image caches still need coverage.
+- Include realistic radio duration, half-duplex deafness while transmitting,
+  hidden-terminal collisions and modem queue limits. Mark any unmodeled behavior.
+- Cover modem restart, offline recipients, queue saturation, clock skew,
+  sequence holes and history at just before/exactly/just after the 48-hour cutoff.
+- Run existing fixtures for startup quietness, bundling, no-echo, selective repair,
+  receipts, requested thumbnails and AX.25. Add real-ARAP signed equivalents.
+- Exercise real TCP adapters with controllable fake KISS/Data2G services so codec
+  tests also cover disconnects, partial reads, ACKMODE tags and connected sessions.
+
+Acceptance: zero-loss cases converge with zero unexpected duplicates; lossy cases
+either converge within a declared retry budget or report incomplete state visibly.
+No test may pass because no frames were exchanged. Quietness is measured after
+excluding explicitly enabled periodic inventory announcements.
+
+## 4. On-air acceptance campaign
+
+Run conducted/attenuated bench checks first, then coordinated RF trials. Record
+station callsigns, hardware, application/ARAP/modem versions, mode/bandwidth,
+configured rate, topology, clock offsets and the exact script for every run.
+Save per-station logs and database snapshots plus modem/PTT traces where available.
+Establish actual A↔B, B↔C and A↔C reachability before asserting a line topology.
+
+Start with unsigned Data2G broadcast; repeat the applicable cases with signing
+enabled, then raw KISS AX.25 on VHF and Data2G connected ARQ. Use available actual
+KISS TNCs to establish compatibility beyond the simulator. Connected sessions are
+point-to-point: test A↔B followed by B↔C for store-and-forward, not broadcast gossip.
+
+| Test | Procedure | Pass evidence |
+| --- | --- | --- |
+| Quiet start | Cold-start/restart an interactive station without auto-sync; open dialogs and select a file | No app-requested RF TX for five minutes or until explicit Send/Sync/Connect; distinguish modem housekeeping |
+| Basic channels | Exchange short, Unicode and fragmented messages in two channels | Exact contents and identities at each intended node; correct channel/unread UI |
+| Busy transmit batching | While one frame is on air, queue ten short messages; repeat with a history page | All messages arrive once; traces show multiple records per subsequent frame; compare frame count/PTT time against batching disabled in a lab build |
+| Gossip/no echo | A requests B's missing history while C listens; then force A's repair request | C caches the response; C does not emit the same history response merely because it heard data or completion traffic |
+| Line relay | Confirm A and C cannot decode each other; exchange messages through B | Both directions converge; hop limits and duplicate suppression hold |
+| Offline delivery | C is off while A sends; B caches; A then goes off and C returns | B delivers the exact recent history without A; receipts return when the author is reachable again |
+| Loss and repair | Introduce controlled frame drops/attenuation on top of logged RF conditions | Missing fragments/proofs recover; complete bodies are not unnecessarily replayed; failures remain visible |
+| Partition/rejoin | Isolate an edge station, send independently, reconnect it | Complete union of eligible history without sequence-hole starvation or permanent retry loops |
+| History window | Seed messages around the 48-hour boundary, including a future timestamp | Routine sync advertises/serves only eligible history; older local records remain readable |
+| Mention receipts | Mention callsign, nick, both aliases and an offline recipient | Receipt only after durable receipt of the full message; relay/restart recovery; no claim of human reading |
+| Requested images | Send metadata, wait, request at C through B, lose some chunks, then request from cache with A offline | Zero thumbnail chunks before request; bounded thumbnail size, exact digest, selective repair, eventual completion; quantify competing-cache duplicate cost |
+| Signing | Trusted, unknown, disabled and rotated keys; signed images; altered content/proofs | Accurate badges and reasons; byte-identical relayed proofs; no trusted status for tampering; quantify proof airtime |
+| Signed receipts | Valid recipient proof, forged receipt, replay and forged confirmation | Only the valid expected identity produces verified delivery; spoofing cannot retire the pending receipt |
+| Reconnect | Drop modem TCP, restart modem and restart the relay during transfer | Durable messages remain; reconnect/sync restores delivery without duplicate identities or an unbounded TX queue |
+| Hidden terminals | A and C transmit concurrently while only B hears both | Collisions are observable; bounded recovery; queues settle when offered traffic stops |
+| Connected ARQ | Call, exchange batches, interrupt/reconnect, change from A↔B to B↔C | Exact stream framing, retained history, responsive chat, correct bandwidth configuration and session status |
+| Soak | Operate relay for 24 hours with periodic conversation, outages and requests | Bounded transient state, no growing retry storm, usable UI, durable database; report intentional history growth separately |
+
+For every run report delivered unique messages / eligible messages, convergence
+time, frames and bytes by type, duplicate frames, repair counts, maximum queue
+depth, PTT seconds, and user-message latency. Compare signed/unsigned and
+batched/unbatched runs using the same corpus and radio settings. Signed overhead
+and broadcast collisions are measurable costs, not grounds to promise zero storms
+or zero duplicates in every topology.
+
+For initial loss-free RF runs use ten short messages per origin and require 100%
+delivery. Predeclare the convergence deadline from measured payload airtime plus
+configured relay/retry delays; do not move it after a failed run. Loss trials
+report delivery at that deadline and time to eventual convergence. Reproduce
+failures with saved traces and convert them into simulator regressions.
+
+## 5. Release gate and execution order
+
+1. Finish and visually verify the image/composer workflow.
+2. Implement ARAP content contract, best-effort proof recovery and structured
+   verification/key lifecycle; add authenticated receipts and packaging.
+3. Pass the reproducible offline/transport suite with the real ARAP CLI.
+4. Complete two-station bench/RF trials, then three-station relay/loss trials,
+   followed by the always-on soak.
+5. Publish a versioned candidate with setup instructions, supported modem/version
+   matrix, recorded signing overhead, known limitations and RF evidence.
+
+Do not call the application fully validated until the UI reports are reproduced
+and resolved, all three transports have applicable evidence, and the signing and
+RF gates above have recorded outcomes. Optional Internet key hosting and future
+station challenge-response do not replace offline message verification.
+
+## Source references
+
+- `kisschat/tui.py`, `kisschat/app.py`, `kisschat/store.py`, `kisschat/auth.py`
+- `kisschat/data2g.py`, `kisschat/protocol.py`, `kisschat/ax25.py`
+- `scripts/simulate_mesh.py`, `fixtures/`, `README.md`
+- `../arap/README.md`, `../arap/protocol/verify.go`, `../arap/identity/trust.go`
+- `../arap/cmd/arap/main.go`, `../arap/docs/IMPLEMENTATION-PLAN.md`
+- `../arap/docs/VALIDATION.md`, `../arap/spec/ARAP-profile-v1.cddl`

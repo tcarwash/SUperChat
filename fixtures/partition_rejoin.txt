@@ -1,0 +1,16 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --contention-window 10 --time-scale 0.1 --script fixtures/partition_rejoin.txt
+partition A B
+send A created while isolated
+wait 2
+verify-partition A B
+rejoin A B
+sync A
+wait 10
+sync C A
+wait 18
+history A
+history B
+history C
+verify
+stats
+quit

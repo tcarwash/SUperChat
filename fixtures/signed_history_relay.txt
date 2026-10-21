@@ -1,0 +1,7 @@
+# Run with: uv run python scripts/run_signed_mesh.py -- --topology line --loss 0 --time-scale 0.1 --contention-window 10 --trace-sync --json-report /tmp/kisschat-signed-history.json --script fixtures/signed_history_relay.txt
+send A real ARAP signed proof must relay through B to C.
+wait 30
+verify-signed B A
+verify-signed C A
+verify
+quit

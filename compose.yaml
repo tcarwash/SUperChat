@@ -1,0 +1,41 @@
+services:
+  kisschat:
+    build: .
+    network_mode: host
+    stop_grace_period: 30s
+    stdin_open: true
+    tty: true
+    environment:
+      DATA2G_HOST: ${DATA2G_HOST:-127.0.0.1}
+      KISSCHAT_HOST: ${KISSCHAT_HOST:-${DATA2G_HOST:-127.0.0.1}}
+      KISSCHAT_KISS_PORT: ${KISSCHAT_KISS_PORT:-}
+      KISSCHAT_KISS_TNC_PORT: ${KISSCHAT_KISS_TNC_PORT:-0}
+      KISSCHAT_AX25_DESTINATION: ${KISSCHAT_AX25_DESTINATION:-CQ}
+      KISSCHAT_DIGIPEATERS: ${KISSCHAT_DIGIPEATERS:-}
+      KISSCHAT_AX25_BAUD: ${KISSCHAT_AX25_BAUD:-1200}
+      KISSCHAT_AX25_INTERFRAME_DELAY: ${KISSCHAT_AX25_INTERFRAME_DELAY:-0.25}
+    command: ["--host", "${KISSCHAT_HOST:-${DATA2G_HOST:-127.0.0.1}}", "--callsign", "${CALLSIGN:?Set CALLSIGN}", "--transport", "${KISSCHAT_TRANSPORT:-broadcast}", "--bandwidth", "${KISSCHAT_BANDWIDTH:-2300}"]
+    volumes:
+      - kisschat-data:/home/kisschat/.local/share/kisschat
+
+  kisschat-relay:
+    profiles: ["relay"]
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      DATA2G_HOST: ${DATA2G_HOST:-127.0.0.1}
+      KISSCHAT_HOST: ${KISSCHAT_HOST:-${DATA2G_HOST:-127.0.0.1}}
+      KISSCHAT_KISS_PORT: ${KISSCHAT_KISS_PORT:-}
+      KISSCHAT_KISS_TNC_PORT: ${KISSCHAT_KISS_TNC_PORT:-0}
+      KISSCHAT_AX25_DESTINATION: ${KISSCHAT_AX25_DESTINATION:-CQ}
+      KISSCHAT_DIGIPEATERS: ${KISSCHAT_DIGIPEATERS:-}
+      KISSCHAT_AX25_BAUD: ${KISSCHAT_AX25_BAUD:-1200}
+      KISSCHAT_AX25_INTERFRAME_DELAY: ${KISSCHAT_AX25_INTERFRAME_DELAY:-0.25}
+    command: ["--host", "${KISSCHAT_HOST:-${DATA2G_HOST:-127.0.0.1}}", "--callsign", "${CALLSIGN:?Set CALLSIGN}", "--transport", "${KISSCHAT_TRANSPORT:-broadcast}", "--bandwidth", "${KISSCHAT_BANDWIDTH:-2300}", "--headless"]
+    volumes:
+      - kisschat-data:/home/kisschat/.local/share/kisschat
+
+volumes:
+  kisschat-data:

@@ -1,0 +1,614 @@
+# SUperChat
+
+SUperChat is a terminal chat client for radio links. Its pane-based interface has
+channel navigation, a message timeline, a station list, link/sync status,
+mention completion, inline Markdown, clickable web links, and a quick channel
+switcher. It supports Data2G's shared
+broadcast/KISS transport, its VARA-compatible connected ARQ transport, and a
+generic raw KISS connection carrying AX.25 UI frames. The modem/TNC host keeps
+ownership of modem, audio, channel access, and PTT.
+Messages render `# headings`, `> quotes`, ordered and bulleted lists, `**bold**`,
+`*italic*`, `__underline__`, `~~strikethrough~~`, and `` `inline code` ``, plus
+fenced code blocks with optional syntax highlighting. Web links and Markdown
+links use terminal hyperlinks when the terminal supports them.
+
+The client reconnects automatically after a radio transport TCP disconnect, with an
+exponential retry delay capped at 30 seconds. Messages sent while the link is
+down stay in local history; after reconnect the station advertises its
+inventory so peers can fetch and relay them. An interactive broadcast client
+does not advertise history on its first connection, so launching it remains
+receive-only until `/sync`, `--auto-sync`, or a later reconnect.
+
+Messages have IRC style channels (`#general`, `#radio`, and so on), a display
+nick, and a local SQLite history. History sync advertises and serves only
+messages timestamped within the current 48-hour window (from `now - 48h` through
+`now`). Other records remain in local history. A foreground broadcast client starts in
+receive mode without an initial inventory burst; use `/sync` to retry incomplete
+history exchanges now or `--auto-sync` to exchange history periodically.
+Headless relay mode enables
+periodic sync automatically, with a randomized 0–30 second delay added to each
+45 second interval so relays started together are less likely to transmit in
+lockstep. In broadcast/KISS mode, inventory and history
+requests are forwarded with a bounded four-hop limit and duplicate suppression.
+History page fragments are public broadcasts: listeners store complete
+messages and announce their inventory later, without immediately rebroadcasting
+the fragments they just heard. When a peer has more history, clients
+request it in small batches. Inventories include sparse sequence bounds, and
+pages follow messages a station actually stores, so a missing sequence does not
+hide later cached messages or create empty page requests. Each station stores
+complete messages and can relay them later. A station that hears a message
+queues an inventory announcement for that origin; repeated messages are
+coalesced and the announcement is delayed randomly by up to 8 seconds to
+stagger listeners. The hop limit and duplicate cache bound mesh forwarding, but
+shared radio airtime can still produce collisions. Always-on clients therefore act
+as store-and-forward nodes: a message can cross several stations and reach a
+client that was offline during the original conversation. Messages outside the
+current 48-hour window remain in local history but are not advertised or
+requested by routine sync. No server is required.
+Large origin inventories are announced in bounded rotating batches and use the
+bulk transmit queue, so later history origins get airtime without delaying new
+chat messages.
+
+Data2G group names are routing/checking labels, not privacy or encryption.
+SUperChat traffic is readable by any station that can decode the broadcast.
+
+## Run
+
+SUperChat installs a `superchat` command from the Python package. The old
+`kisschat` command remains available as a compatibility alias. To install it on a
+workstation with `pipx`:
+
+```sh
+pipx install .
+superchat --host 192.0.2.10 --callsign N0CALL
+```
+
+This creates a regular executable command while keeping its Python dependencies
+isolated. The Docker Compose setup below is optional and is useful for running
+an always-on relay.
+
+To build a self-contained executable for the current operating system, install
+`uv` and run:
+
+```sh
+./scripts/build-binary.sh
+./dist/SUperChat --host 192.0.2.10 --callsign N0CALL
+```
+
+The build produces a single-file executable in `dist/`. Build it on each target
+operating system; PyInstaller does not cross-compile binaries.
+
+## Simulate a radio mesh
+
+Exercise three real SUperChat instances without a modem or RF connection:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0.15 \
+  --bitrate 1200 --propagation 0.05
+```
+
+The simulator starts stations A, B, and C with temporary SQLite databases. In
+the `line` topology, A and C can only hear B. Use `send A text`, `sync C`,
+`sync A C` / `sync C A` to fetch the other edge station's history through B,
+`forget C A` to remove A's cached history from C, `history B`, `verify`,
+`stats`, and `wait 5` at the prompt. `verify` compares the message sets stored
+by all three stations and exits with an error if they do not converge. Run the
+checked-in three-station conversation with simulated loss and timing using:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0.05 \
+  --contention-window 10 --time-scale 0.1 \
+  --script fixtures/three_station_conversation.txt
+```
+
+To exercise a one-way link where C hears A but A cannot hear C, run:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology asymmetric --loss 0 \
+  --contention-window 10 --time-scale 0.1 \
+  --script fixtures/asymmetric_hearing.txt \
+  --json-report /tmp/kisschat-asymmetric-report.json
+```
+
+The fixture verifies reception and non-reception by exact message identity; the
+JSON report includes the directed transmit-to-listener map.
+
+To run the repeatable 0%, 5%, 15% and 30% packet-loss matrix with a fixed seed
+and capture sync traces in a combined report, use:
+
+```sh
+uv run python scripts/run_loss_matrix.py \
+  --script fixtures/loss_matrix_smoke.txt \
+  --seed 7 --output /tmp/kisschat-loss-matrix.json
+```
+
+Each rate is an independent three-station run with the same scenario and seed.
+The combined report includes the simulator output and per-station database
+snapshots; the runner exits nonzero if any run misses its convergence check.
+The seed controls per-station backoff and per-link loss draws; host thread
+scheduling can still change retry timing and exact traffic counters.
+
+To simulate a temporary link outage, verify isolation, then rejoin the edge
+stations and sync the retained history through B:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 10 --time-scale 0.1 \
+  --script fixtures/partition_rejoin.txt \
+  --json-report /tmp/kisschat-partition-report.json
+```
+
+The script's `partition`, `verify-partition`, and `rejoin` commands update the
+simulated radio links. `verify-partition` fails if any post-partition message
+crosses the disconnected link; the fixture then requires all three stores to
+converge after reconnection. The JSON report records the configuration, checks,
+per-station counters, active links and exact message rows at each station. A
+scripted report run exits nonzero if it runs no verification check or any check
+fails.
+
+To run the relay path through the raw KISS and AX.25 UI frame codec, use:
+
+```sh
+uv run python scripts/simulate_mesh.py --transport ax25 --topology line \
+  --loss 0 --time-scale 0.1 --script fixtures/ax25_line_smoke.txt
+```
+
+This wraps application batches in AX.25 UI frames and KISS TCP frames before
+the simulated stations receive them. It checks the codec and store-and-forward
+path without opening a TNC connection or transmitting on air.
+
+To confirm that starting an interactive client stays receive-only, run:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --time-scale 0.1 --script fixtures/startup_receive_only.txt
+```
+
+The `verify-quiet` command fails if startup queued or transmitted any KISS frames.
+
+To confirm that a burst of short messages shares radio frames, run:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 10 --time-scale 0.1 \
+  --script fixtures/message_bundling.txt
+```
+
+The fixture's `verify-bundling` command requires at least one radio frame to
+carry multiple chat messages; `verify` then checks delivery to all stations.
+
+To verify that thumbnail bytes stay local until explicitly requested, run:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 10 --time-scale 0.1 \
+  --script fixtures/requested_thumbnail.txt
+```
+
+The fixture checks that C receives the attachment metadata without image
+fragments, then requests the thumbnail and checks the completed bytes.
+
+To check the 48-hour history boundary through the line relay, run:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 1 --time-scale 0.1 \
+  --script fixtures/history_window.txt
+```
+
+This leaves one message older than 48 hours in B's cache and verifies that C
+receives the recent message only.
+
+To verify a mention receipt from C returns to A through B, run:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 1 --time-scale 0.1 \
+  --script fixtures/mention_receipt.txt
+```
+
+To assert that C caches a broadcast history page and does not retransmit its
+fragments, run:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 10 --time-scale 0.1 \
+  --script fixtures/no_echo.txt
+```
+The check requires C to receive actual message fragments and its page-end
+before passing, so an empty response cannot pass as a successful case.
+
+History page fragments are broadcast to nearby listeners so they can cache
+the messages during someone else's sync. Cached listeners announce their
+inventory later; they do not immediately retransmit the heard fragments.
+
+For selective repair after a deliberately dropped fragment, run the focused
+fixture:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 10 --time-scale 0.1 --drop-first-history-fragment \
+  --trace-sync --script fixtures/selective_repair.txt
+```
+
+Its final verifier requires exactly one repair request and confirms B sent
+only the missing fragment after the original page; all three stations must
+converge.
+To check recovery when the entire page-end is lost, run:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 10 --time-scale 0.1 --drop-first-history-page-end \
+  --trace-sync --script fixtures/lost_page_end.txt
+```
+
+The simulator retries after 12 seconds so the fixture can verify the automatic
+retry against its modeled radio timing; normal clients retry after 90 seconds,
+with bounded exponential backoff. A page retry asks for the page manifest first;
+it then repairs only fragments the receiver is still missing.
+
+To verify real ARAP signing across the A—B—C simulator, build the sibling ARAP
+CLI and run the disposable-key fixture:
+
+```sh
+make -C ../arap build
+uv run python scripts/run_signed_mesh.py -- --topology line --loss 0 \
+  --time-scale 0.1 --contention-window 10 --trace-sync \
+  --json-report /tmp/kisschat-signed-history.json \
+  --script fixtures/signed_history_relay.txt
+```
+
+The wrapper creates encrypted test-only keys and a local trust store in a
+temporary directory, then removes them after the run. The report checks that
+the signature verifies at each station and the detached proof bytes match.
+This tests simulated transport and the real ARAP CLI; it does not test RF.
+For signed proof repair after stopping A's simulator process, run:
+
+```sh
+uv run python scripts/run_signed_mesh.py -- --topology line --loss 0 \
+  --time-scale 0.1 --contention-window 10 --drop-first-proof-fragment \
+  --trace-sync --json-report /tmp/kisschat-signed-proof-loss.json \
+  --script fixtures/signed_proof_loss_offline_origin.txt
+```
+
+The fixture verifies a trusted proof at B, stops A's chat process/database and
+radio receiver, then drops one B-to-C proof fragment during C's history sync.
+C must restore the exact proof through proof-only repair and verify it without
+another copy of the message body. A then restarts from its durable database.
+This does not emulate rebooting a physical modem or transmitting over RF.
+`--loss` applies independent receive loss, while `--bitrate`, `--propagation`,
+`--interframe`, and `--framing-bytes` control radio timing. `--time-scale 0.1`
+runs simulated airtime ten times faster (script `wait` commands remain wall-clock
+seconds); `--seed` sets the packet-loss random seed. `stats` reports frames,
+records, bytes, estimated airtime, losses, collisions, and selective page repair
+requests.
+The optional `--drop-first-history-fragment` switch drops one A-origin history
+fragment from B's response during the focused fixture's targeted sync. Set `--loss` above
+zero to add independent receiver packet loss; those runs may need extra sync
+rounds before `verify` passes.
+
+Use a dedicated Data2G host connection for this app. Data2G's command interface
+is single client for its command and ARQ services. Run SUperChat on a client
+that can reach TCP ports 8300 and 8100 on the host for broadcast mode:
+
+```sh
+python -m kisschat --host 192.0.2.10 --callsign N0CALL
+```
+
+For VARA-compatible connected mode, also allow the data port (default 8301):
+
+```sh
+python -m kisschat --host 192.0.2.10 --callsign N0CALL --transport connected
+```
+Set `--bandwidth 500` when the ARQ link must stay within a 500 Hz segment;
+the default cap is 2300 Hz. The option is ignored by broadcast/KISS transport.
+
+For VHF packet radio, connect to a standard raw KISS TCP endpoint (for example,
+Dire Wolf's default KISS server on port 8001):
+
+```sh
+python -m kisschat --host 192.0.2.10 --callsign N0CALL --transport ax25
+```
+
+This sends each SUperChat record as the information field of an AX.25 UI frame
+with PID `0xF0`, destination `CQ`, and source `N0CALL`. Configure another
+destination or a digipeater path with `--ax25-destination` and
+`--digipeaters WIDE1-1,WIDE2-1`. `--kiss-tnc-port` selects a multiport TNC
+channel. Raw KISS TCP defaults to port 8001 in this mode; override it with
+`--kiss-port`. A serial KISS TNC can be exposed over TCP with a local KISS
+bridge. This mode uses standard KISS data frames and does not use Data2G's
+ACKMODE extension, so the modem does not report per-frame on-air confirmations
+to SUperChat. AX.25 transmit submissions are paced using estimated frame
+airtime; set `--ax25-baud` to the radio bit rate and adjust
+`--ax25-interframe-delay` for extra spacing. This only limits the host queue;
+the TNC still controls channel access and PTT. UI frames are best-effort;
+digipeating and packet size depend on the configured radio path.
+When several records are queued, SUperChat compresses and bundles them into one
+radio frame when they fit. AX.25 bundles stay within the 256-byte information
+field limit; Data2G broadcast bundles stay within SUperChat's 220-byte record
+limit; connected ARQ bundles stay within its 255-byte stream-record limit.
+Broadcast interactive traffic waits for its preceding ACKMODE receipt before
+the next frame is submitted, so messages typed while one is on air can be
+bundled together. Long records that do not fit remain separate. Receiving
+clients unpack the bundle before processing each record. All stations that
+should receive bundled traffic need a SUperChat version that understands this
+format.
+
+Install the locked dependencies and run it locally with `uv`:
+
+```sh
+uv sync --locked --no-dev
+uv run superchat --host 192.0.2.10 --callsign N0CALL --nick Alice
+```
+
+The default history database is `~/.local/share/kisschat/chat.sqlite3`. Each
+installation keeps its own stable node ID, outgoing sequence counter, selected
+nick, and last selected channel there. The initial channel is the last selected
+channel, or `#general` on first run; `--channel` overrides it. Give each station
+a unique callsign and keep its database between runs.
+
+Useful options:
+
+```text
+--version               print the SUperChat version and exit
+--host HOST             Data2G or raw KISS TNC host/IP
+--callsign CALL         station identity sent to Data2G
+--nick NAME             display name (defaults to callsign)
+--channel #NAME         initial channel (last selected, or #general on first run)
+--mode MODE             optional Data2G broadcast transmit mode
+--transport TRANSPORT   broadcast (default), connected, or ax25
+--bandwidth HZ          connected ARQ cap: 500, 1200, 2300, or 2750
+--auto-sync             periodically exchange history (transmits on air)
+--command-port PORT     default 8300
+--kiss-port PORT        raw KISS TCP port; 8001 for ax25, 8100 for Data2G
+--kiss-tnc-port PORT    raw KISS TNC channel, default 0
+--ax25-destination CALL AX.25 UI destination, default CQ
+--digipeaters PATH      comma-separated AX.25 digipeater path
+--db PATH               SQLite database path
+```
+
+## Commands
+
+Type a message and press Enter to send it to the current channel.
+Use **↑ Load older** above the timeline to expand the visible history in
+200-message steps; it is disabled once all locally stored channel history is shown.
+
+```text
+/join #channel          switch the displayed channel
+/nick name              change the display name
+/image PATH [caption]   send a compressed thumbnail; quote paths with spaces
+/image-get ORIGIN:SEQ   request one shown thumbnail
+/images                 pick a channel thumbnail to request
+/search TEXT            search this channel's local and synced history
+/history [count]        show recent local and synced messages
+/channels               list channels in local history
+/sync                   advertise local history now
+/clear-history          confirm and erase this device's local history/cache
+/cq                     send a Data2G discovery frame in connected mode
+/connect CALLSIGN       call a station with connected transport
+/disconnect             end the connected ARQ session
+/help                   show command summary
+/quit                   exit
+```
+
+`/clear-history` removes all locally stored messages, image data, receipts,
+and partial transfers; it also discards frames still waiting in this client's
+transmit queues. It preserves this station's identity and sequence counter.
+It cannot erase copies already held by other stations, which can later sync
+those messages back to this device.
+
+`Ctrl+Shift+K` opens the fuzzy channel switcher; `Ctrl+Shift+F` searches the
+current channel. Search is a literal, case-insensitive match across local and
+synced message text. Use `/history` to return to the recent timeline.
+Tab-complete an `@mention` using a recently heard station's callsign (including
+portable `/` suffixes) or advertised nick; stations expire from the list and
+suggestions after 15 minutes without an inventory. In connected mode, Tab also
+completes recently heard callsigns after `/connect`. Nicks containing spaces
+can be mentioned with quotes, for example `@"Alice Smith"`; Tab completes this
+form too. The channel list marks unread messages and shows a separate `@` count
+when a background-channel message mentions this station.
+Those badges survive restarts and clear when you open the channel.
+
+The app retains all channels in one KISS broadcast group. Channel selection is
+application level; it does not make channel contents private. Joined channel
+names persist locally, including channels that do not have messages yet.
+
+For a directed, reliable Data2G ARQ link, start with
+`--transport connected`. Each client listens for incoming sessions; call a
+station with `/connect CALLSIGN`. Use `/cq` to transmit one Data2G discovery
+frame while idle; stations that hear it appear in the station list and become
+available for `/connect` completion. CQ transmission is explicit and does not
+start a session. SUperChat enables Data2G's `CHAT ON` latency
+profile and uses the VARA-compatible data stream for chat records. Only one
+connected session can be active on a Data2G host at a time. Channel names remain
+in the shared chat records, while the active ARQ peer is the only station that
+receives them directly; relays can sync and forward history when they connect.
+
+Messages containing `@callsign` or `@nick` show a waiting marker. When a client
+whose current callsign or nick matches the mention receives and stores the full
+message, it stores a receipt and sends it toward the author. Nearby stations
+persist and relay pending receipts, retrying with increasing delays until the
+author confirms receipt. On restart, clients reconstruct missing receipts from
+stored messages before syncing. The author broadcasts that confirmation so relays can
+stop retrying. A receipt names the station that stored the message; it does not
+mean a person has read it. Receipts are app-level reports from the receiving
+station and are not cryptographically authenticated.
+If a message mentions the same station by both its callsign and nick, the
+receiver acknowledges each alias separately.
+
+## Inline thumbnails
+
+Use the **＋ Image** button to browse for a file with the desktop chooser (when
+`zenity` or `kdialog` is installed), or enter its path directly. You can also
+use `/image PATH [caption]` to attach an image. Quote
+the path if it contains spaces, for example `/image "/home/radio field/photo.jpg" portable setup`.
+SUperChat corrects orientation, scales the longest edge to at most 160 pixels, and encodes
+a JPEG thumbnail capped at 8 KiB (at most about 59 radio fragments). The message
+advertises only its digest and thumbnail dimensions; image bytes stay on the sending station until a receiver
+requests that specific image. The right panel lists recent thumbnails in the
+current channel; select one and press **Request selected**. The message also shows a request command, for example
+`/image-get 0123abcd:42`. Any nearby station that has cached the thumbnail can
+answer, so requests can use the same store-and-forward mesh as chat. A unique
+request ID lets receivers retry if radio frames are lost. Caches exchange
+response claims and converge on one station ID, with a brief settle period to
+reduce duplicate thumbnail transmissions across multiple hops. Returned
+chunks carry that request ID and a four-hop limit; each station forwards a chunk
+only once for that request, preventing relay loops while allowing remote receivers
+to fetch from an always-on cache. Each node retains up to 64 MiB of requested
+thumbnail data in insertion order; message history and attachment metadata remain
+available after an older cached image is evicted, so it can be fetched again from
+another station.
+
+Received thumbnails appear inline as terminal half-block previews. Their visual
+color fidelity depends on true-color terminal support. Original image files are
+never transmitted. Attachments sync as metadata with message history, while the
+thumbnail itself is fetched only on request.
+In broadcast/KISS mode, requests are relayed up to four stations away. Nearby
+nodes cache returned thumbnails they overhear and can serve them later. In
+connected ARQ mode, a request is served by the current peer if it has the
+thumbnail; connect through a cache node to request from it. Selecting an
+incomplete thumbnail again asks caches only for the missing chunks. After an
+explicit request, SUperChat also retries missing chunks up to three times when
+radio frames are lost; completed thumbnails are never fetched automatically.
+
+## Optional ARAP message verification
+
+SUperChat can sign each outgoing message with an ARAP Ed25519 content proof.
+The detached proof is sent in compact KISS frames and stored with the message,
+so always-on relays forward it with synchronized history. The signature binds
+the origin ID, sequence, timestamp, channel, nick, signing callsign, and body.
+Attached thumbnails also bind their digest, dimensions, and size.
+Clients display `✓ Verified` only when ARAP verifies both the proof and content
+and that client's ARAP trust store authorizes the signing key for
+`content-signature`. A cryptographically valid proof without local trust is
+shown as signed but untrusted. If the public key or ARAP verifier is unavailable,
+the signature is shown as unchecked rather than implying it was verified. A bad
+proof is marked invalid. Saved untrusted or unchecked proofs are retried on a
+later launch, so adding the key or trust binding can update their status.
+Messages from clients without ARAP remain unsigned. Signature verification does
+not encrypt radio traffic. Signing is best-effort: a configured client sends the
+chat message immediately, then signs it asynchronously. If key access or signing
+fails, the message remains sent and is marked unsigned while SUperChat retries
+the proof later; sending never waits for ARAP.
+The signed message fields and canonical bytes are defined by the
+[KISSChat-message-v1 profile](docs/ARAP-CONTENT-PROFILE.md), shared with ARAP's
+independent Go adapter.
+When signing is enabled, a pending signing record is committed with each local
+message; interrupted signing jobs resume at the next requested or automatic
+history sync so an interactive client stays quiet on its first connection.
+
+Build the `arap` CLI from the sibling `../arap` project and put its `bin`
+directory on `PATH` (or set `ARAP_CLI` to the binary path). Create an encrypted
+station key and put its public key in the local key directory:
+
+```sh
+make -C ../arap build
+export PATH="$PWD/../arap/bin:$PATH"
+mkdir -p ~/.config/arap ~/.config/kisschat/keys
+arap keygen --private-key ~/.config/arap/N0CALL.age \
+  --public-key ~/.config/kisschat/keys/N0CALL.pub.pem
+arap trust add --store ~/.config/arap/trust.json \
+  --public-key ~/.config/kisschat/keys/N0CALL.pub.pem --callsign N0CALL
+```
+
+Exchange public keys with stations you trust, place them in the same directory
+as `<CALLSIGN>.pub.pem`, and add them to the ARAP trust store with
+`arap trust add`. Start SUperChat with `--arap-key ~/.config/arap/N0CALL.age`;
+`--arap-cli`, `--arap-key-dir`, and `--arap-trust-store` select the CLI and
+local verification configuration. Set `KISSCHAT_ARAP_PASSPHRASE` in the
+process environment to sign with an encrypted key without an interactive
+prompt. ARAP callsigns must contain 3–20 ASCII letters, digits, and properly
+placed slashes, with at least one letter and one digit. A Data2G callsign that
+does not meet ARAP's grammar can still chat, but its messages cannot be signed
+or shown as ARAP-verified. Signing is disabled when `--arap-key` is omitted. All participating
+clients need this proof-capable version to show verified badges; older clients
+ignore proof frames and still display the message. The default Docker image
+does not bundle the separately maintained ARAP CLI; for Compose signing, build
+a derived image that includes `arap` and mount the key and trust directories.
+
+## Docker Compose
+
+Set `DATA2G_HOST` to the reachable modem host and `CALLSIGN` to this station's
+identity, then run `docker compose run --rm kisschat`. The Compose service uses
+host networking so the configured TCP ports can reach the host or a remote
+modem host without NAT mappings. The database lives in the `kisschat-data`
+volume. Containers run the app as an unprivileged `kisschat` account; the entrypoint
+repairs volume ownership before dropping privileges, including for an existing database.
+The image installs application dependencies from the checked-in `uv.lock` and
+fails the build if the lock no longer matches `pyproject.toml`.
+
+```sh
+DATA2G_HOST=192.0.2.10 CALLSIGN=N0CALL docker compose run --rm kisschat
+```
+
+Set `KISSCHAT_TRANSPORT=connected` to use Data2G's VARA-compatible connected
+mode from Compose. That mode also needs TCP port 8301 reachable from the
+container; the provided Compose services use host networking. Set
+`KISSCHAT_BANDWIDTH=500` (or `1200`, `2300`, `2750`) to choose its ARQ cap.
+
+For raw KISS over TCP, set `KISSCHAT_TRANSPORT=ax25` and point
+`KISSCHAT_HOST` at the KISS server (Dire Wolf defaults to port 8001). Optional
+`KISSCHAT_KISS_PORT`, `KISSCHAT_KISS_TNC_PORT`,
+`KISSCHAT_AX25_DESTINATION`, `KISSCHAT_DIGIPEATERS`, `KISSCHAT_AX25_BAUD`,
+and `KISSCHAT_AX25_INTERFRAME_DELAY` configure the endpoint, AX.25 UI
+address/path, and airtime pacing.
+
+```sh
+KISSCHAT_TRANSPORT=ax25 KISSCHAT_HOST=192.0.2.20 CALLSIGN=N0CALL \
+  KISSCHAT_AX25_DESTINATION=CQ KISSCHAT_DIGIPEATERS=WIDE1-1,WIDE2-1 \
+  docker compose run --rm kisschat
+```
+
+For an always-on history relay on a Docker host, run the headless profile:
+
+```sh
+DATA2G_HOST=192.0.2.10 CALLSIGN=N0CALL docker compose --profile relay up -d kisschat-relay
+```
+
+Run only one SUperChat instance against a given Data2G command service because
+Data2G gives that command interface to one client at a time. The relay profile
+restarts after host/container restarts and keeps the same message database.
+
+## Wire and sync notes
+
+The app uses a compact binary message-fragment record inside KISS payloads.
+Each frame is at most 220 bytes. Text fragments use the space left after the
+actual channel and nick fields, reducing fragment count for typical short
+names; longer messages are split and reassembled. History page data is
+broadcast once so every listener can cache it; the listener advertises its
+updated inventory later instead of echoing the same fragments. The page-end
+record stays addressed to the requester and lists the message sequence numbers
+it covered. The receiver asks for only missing fragment indices when it retained
+a partial message; if no fragment arrived, it requests the whole message.
+Page-end records and fragment-repair requests use compact binary forms to fit
+their sequence and bitmask data in one frame.
+ARAP COSE proofs use a separate versioned frame record and are independently
+reassembled, stored, and forwarded alongside their messages. When message
+history already matches, peers periodically request a recent proof-only page
+so dropped signature frames can be repaired without replaying message bodies.
+The default maximum message length is 4096 UTF-8 bytes. Message history is
+stored per origin with a monotonically increasing sequence number. A newly
+heard peer advertises contiguous history, after which the clients exchange missing
+records in batches of up to 8 messages. History fragments and signature proofs
+use the bulk transmit queue so chat and control traffic can pass them. Imported records are re-advertised so
+nearby clients can fetch and relay them. Mentions use durable application
+receipt records that are sent only after the recipient has stored the complete message.
+For each origin window, a client requests one directly heard cache at a time;
+forwarded inventory remains useful gossip but does not make an out-of-range
+origin compete with the relay that can actually deliver the broadcast page.
+KISS ACKMODE receipts pace the broadcast writer with at most 32 frames in
+flight. A receipt confirms only that Data2G sent a frame on air; it does not
+mean a remote station received the message. Dropped frames are released from
+the local window and can be repaired by later history or image requests.
+
+Broadcast/KISS remains the default transport for chat, mentions, and history
+sync. The optional `--transport connected` mode uses Data2G's VARA-compatible
+ARQ session and TCP data stream for reliable directed transfer and history
+sync. Connected delivery still requires peer sessions for relaying between
+stations; KISS ACKMODE and ARQ link acknowledgments are modem/link-layer signals,
+not application-level proof that a person read a message.
+
+The optional `--transport ax25` mode uses raw KISS and wraps chat records in
+AX.25 UI frames. It does not require the Data2G command service. Application
+store-and-forward and history sync work over the configured AX.25 path, within
+the airtime and frame-size limits of that path.

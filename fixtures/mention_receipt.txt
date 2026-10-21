@@ -1,0 +1,6 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --contention-window 1 --time-scale 0.1 --script fixtures/mention_receipt.txt
+send A @K0CCC Please acknowledge this message.
+wait 20
+verify-receipt A C
+history A
+quit

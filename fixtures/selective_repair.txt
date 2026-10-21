@@ -1,0 +1,9 @@
+# Run with: uv run python scripts/simulate_mesh.py --topology line --loss 0 --contention-window 10 --time-scale 0.1 --drop-first-history-fragment --trace-sync --script fixtures/selective_repair.txt
+send A random 450
+wait 5
+forget C A
+sync C A
+wait 10
+history C
+verify
+quit
