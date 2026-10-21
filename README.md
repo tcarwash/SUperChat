@@ -17,19 +17,22 @@ exponential retry delay capped at 30 seconds. Messages sent while the link is
 down stay in local history; after reconnect the station advertises its
 inventory so peers can fetch and relay them. An interactive broadcast client
 does not advertise history on its first connection, so launching it remains
-receive-only until `/sync`, `--auto-sync`, or a later reconnect.
+receive-only until `/sync`, the first periodic sync, or a later reconnect.
 
 Messages have IRC style channels (`#general`, `#radio`, and so on), a display
 nick, and a local SQLite history. History sync advertises and serves only
 messages timestamped within the current 48-hour window (from `now - 48h` through
 `now`). Other records remain in local history. A foreground broadcast client starts in
-receive mode without an initial inventory burst; use `/sync` to retry incomplete
-history exchanges now or `--auto-sync` to exchange history periodically.
+receive mode without an initial inventory burst. It periodically exchanges
+history by default, which lets clients recover messages lost when stations
+transmit at the same time. Use `/sync` to retry incomplete exchanges now or
+`--no-auto-sync` to disable periodic radio traffic.
 Headless relay mode enables
 periodic sync automatically, with a randomized 0–30 second delay added to each
 45 second interval so relays started together are less likely to transmit in
-lockstep. In broadcast/KISS mode, inventory and history
-requests are forwarded with a bounded four-hop limit and duplicate suppression.
+lockstep. Routine inventories and history requests stay between directly heard
+neighbors. Each cache re-announces history it stores, so messages cross several
+hops without flooding every inventory or query back through the mesh.
 History page fragments are public broadcasts: listeners store complete
 messages and announce their inventory later, without immediately rebroadcasting
 the fragments they just heard. When a peer has more history, clients
@@ -39,7 +42,7 @@ hide later cached messages or create empty page requests. Each station stores
 complete messages and can relay them later. A station that hears a message
 queues an inventory announcement for that origin; repeated messages are
 coalesced and the announcement is delayed randomly by up to 8 seconds to
-stagger listeners. The hop limit and duplicate cache bound mesh forwarding, but
+stagger listeners. Bounded retries use independent jitter, but
 shared radio airtime can still produce collisions. Always-on clients therefore act
 as store-and-forward nodes: a message can cross several stations and reach a
 client that was offline during the original conversation. Messages outside the
@@ -48,6 +51,12 @@ requested by routine sync. No server is required.
 Large origin inventories are announced in bounded rotating batches and use the
 bulk transmit queue, so later history origins get airtime without delaying new
 chat messages.
+Each newly sent chat message is followed by a compact summary of up to eight
+recent origin ranges. The ranges rotate across messages when a station knows
+more than eight origins. A peer uses the summary to request missing history
+from the station that directly sent it, reducing the wait for periodic sync.
+Older clients ignore these summary frames and continue to use regular inventory
+sync.
 
 Data2G group names are routing/checking labels, not privacy or encryption.
 SUperChat traffic is readable by any station that can decode the broadcast.
@@ -100,6 +109,43 @@ uv run python scripts/simulate_mesh.py --topology line --loss 0.05 \
   --contention-window 10 --time-scale 0.1 \
   --script fixtures/three_station_conversation.txt
 ```
+
+To interact with three real clients through the same radio model, open one
+terminal window per station (requires a graphical session and `gnome-terminal`,
+`konsole`, or `xterm`):
+
+```sh
+uv run python scripts/interactive_mesh.py --topology line --loss 0.10 \
+  --loss-model bursty --seed 7
+```
+
+Each window runs a normal client with a temporary database. Press Ctrl-C in the
+launcher terminal to stop the bridge, close its client processes, and remove
+those databases. The mesh log records the bridge start and shutdown reason.
+
+To capture a live trace, close the old client windows and run:
+
+```sh
+uv run python scripts/interactive_mesh.py --topology line --loss 0 \
+  --contention-window 2 --debug-log /tmp/superchat-debug.log
+```
+
+This writes the mesh log and separate `superchat-debug-A.log`, `-B.log`, and
+`-C.log` client logs beside it. The files are cleared at startup. Client events
+distinguish queued records (`TX_QUEUE`), modem submissions (`TX_SUBMIT`), and
+received records (`RX`). Raw KISS submission does not confirm reception on air.
+Logs include message contents. Use `--debug-log PATH` with `superchat` directly
+to capture a station outside the simulator.
+
+Exercise automatic recovery without manual sync commands:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 2 --auto-sync --script fixtures/automatic_sync_line.txt
+```
+
+The scripted simulator otherwise leaves automatic sync disabled. This fixture
+sends three messages and checks that every station receives all three.
 
 To exercise a one-way link where C hears A but A cannot hear C, run:
 
@@ -358,7 +404,8 @@ Useful options:
 --mode MODE             optional Data2G broadcast transmit mode
 --transport TRANSPORT   broadcast (default), connected, or ax25
 --bandwidth HZ          connected ARQ cap: 500, 1200, 2300, or 2750
---auto-sync             periodically exchange history (transmits on air)
+--auto-sync             periodically exchange history (default; transmits on air)
+--no-auto-sync          disable periodic history exchange
 --command-port PORT     default 8300
 --kiss-port PORT        raw KISS TCP port; 8001 for ax25, 8100 for Data2G
 --kiss-tnc-port PORT    raw KISS TNC channel, default 0
@@ -442,10 +489,15 @@ Use the **＋ Image** button to browse for a file with the desktop chooser (when
 `zenity` or `kdialog` is installed), or enter its path directly. You can also
 use `/image PATH [caption]` to attach an image. Quote
 the path if it contains spaces, for example `/image "/home/radio field/photo.jpg" portable setup`.
-SUperChat corrects orientation, scales the longest edge to at most 160 pixels, and encodes
+SUperChat corrects orientation and scales new thumbnails to fit within 80×72
+pixels, twice the inline preview's default 40×36 pixel resolution. It encodes
 a JPEG thumbnail capped at 8 KiB (at most about 59 radio fragments). The message
-advertises only its digest and thumbnail dimensions; image bytes stay on the sending station until a receiver
-requests that specific image. The right panel lists recent thumbnails in the
+advertises only its digest and thumbnail dimensions; image bytes stay on the
+sending station until a receiver requests that specific image. Downloaded
+thumbnails are saved as JPEG blobs in the station's SQLite database at
+`~/.local/share/kisschat/chat.sqlite3` by default, with a 64 MiB image cache cap.
+The original full-size source file is not stored by SUperChat. The right panel
+lists recent thumbnails in the
 current channel; select one and press **Request selected**. The message also shows a request command, for example
 `/image-get 0123abcd:42`. Any nearby station that has cached the thumbnail can
 answer, so requests can use the same store-and-forward mesh as chat. A unique
@@ -454,10 +506,34 @@ response claims and converge on one station ID, with a brief settle period to
 reduce duplicate thumbnail transmissions across multiple hops. Returned
 chunks carry that request ID and a four-hop limit; each station forwards a chunk
 only once for that request, preventing relay loops while allowing remote receivers
-to fetch from an always-on cache. Each node retains up to 64 MiB of requested
+to fetch from an always-on cache. The requester fetches up to eight missing chunks
+at a time, bounded by the request frame size, and advances when that window arrives. New chunks extend the repair
+timeout, and retries request only missing chunks in the active window. The
+requester defers background cache inventories while receiving a window and sends
+them before requesting the next one. Local chat recovery announcements can pass
+during a download. Unsigned local recovery hints use the compact history summary;
+recent single-frame message repairs and their page ends use the normal chat queue.
+Attachment metadata is re-announced independently of message text: origin hints
+repeat the latest attachment, and periodic inventories rotate through one recent
+attachment per cycle. This lets a caption recover its image indicator even when
+the original metadata frame was lost after the caption arrived.
+Every listener with the attachment metadata can assemble, display, and cache the
+overheard image, including a station that never requested it. Passive listeners
+do not start repair requests. Senders suppress returning copies of their own
+chunks so relay traffic does not echo back into the transfer.
+Each node retains up to 64 MiB of requested or overheard
 thumbnail data in insertion order; message history and attachment metadata remain
 available after an older cached image is evicted, so it can be fetched again from
 another station.
+
+To exercise a larger image through a line relay with only C requesting it and B
+caching it from overhearing:
+
+```sh
+uv run python scripts/simulate_mesh.py --topology line --loss 0 \
+  --contention-window 2 --time-scale 0.05 --image-pattern noise \
+  --script fixtures/image_window_overhearing.txt
+```
 
 Received thumbnails appear inline as terminal half-block previews. Their visual
 color fidelity depends on true-color terminal support. Original image files are
@@ -593,9 +669,18 @@ records in batches of up to 8 messages. History fragments and signature proofs
 use the bulk transmit queue so chat and control traffic can pass them. Imported records are re-advertised so
 nearby clients can fetch and relay them. Mentions use durable application
 receipt records that are sent only after the recipient has stored the complete message.
-For each origin window, a client requests one directly heard cache at a time;
-forwarded inventory remains useful gossip but does not make an out-of-range
-origin compete with the relay that can actually deliver the broadcast page.
+For each origin window, a client requests one directly heard cache at a time.
+Inventories include an optional signature availability mask, allowing new peers
+to skip proof requests for unsigned history. Older inventories retain bounded
+proof discovery, and old clients can still read the inventory and message records.
+
+The conversation stays in message timestamp order, including late history repairs.
+New arrivals have a subtle background that fades over 12 seconds. Nickname colors
+and symbols distinguish your messages (purple), directly heard messages (teal),
+and relayed messages (amber, ↪). A neutral question mark means the path is unknown.
+Raw AX.25 reception retains source and digipeater evidence for this distinction;
+older stored messages and transports without source metadata remain unknown.
+Reception colors describe the path, independently of signature verification.
 KISS ACKMODE receipts pace the broadcast writer with at most 32 frames in
 flight. A receipt confirms only that Data2G sent a frame on air; it does not
 mean a remote station received the message. Dropped frames are released from

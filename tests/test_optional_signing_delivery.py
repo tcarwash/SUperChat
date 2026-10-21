@@ -18,6 +18,9 @@ class OptionalSigningDeliveryTests(unittest.TestCase):
                 order.append("stored")
                 return dict(message)
 
+            def inventory(self, _since):
+                return []
+
         class Data:
             def send(self, frame):
                 order.append("body-frame")
@@ -33,6 +36,7 @@ class OptionalSigningDeliveryTests(unittest.TestCase):
         chat.pending_local_delivery = threading.Event()
         chat._queue_signature = lambda _message: order.append("sign-queue-full") or False
         chat.announce_origin = lambda *_args, **_kwargs: True
+        chat._queue_relay_announcement = lambda _origin: None
 
         chat.publish("hello")
 

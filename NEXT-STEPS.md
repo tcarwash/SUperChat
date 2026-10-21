@@ -39,6 +39,86 @@ badges. Known boundaries visible in source:
 
 ## Progress log
 
+- 2026-10-21 orphaned-caption fix: in the current live trace, A's caption
+  (origin d6dfd5, sequence 2, "dorc") reached B at 19:18:25 UTC, but the separate
+  attachment record collided at 19:18:27. A's read-only database inspection showed
+  the 6,245-byte 160x160 attachment; B and C had the caption without attachment
+  metadata. Equal message highwaters prevented another body/history request, so
+  metadata had no independent repair path. Origin announcements now repeat the
+  origin's latest attachment metadata, and periodic inventories rotate through
+  one recent attachment record per cycle across all channels. These repair
+  advertisements are neighbor-only and do not send image data. A cache learning
+  metadata for an existing caption schedules its own announcement for the next
+  hop. Late attachment events now refresh the image list immediately as well as
+  invalidating the message render cache. No tests or new live run performed.
+
+- 2026-10-21 latency and conversation follow-up: the saved KISS/TCP trace showed
+  C's collided chat waiting behind its own image receive window before announcing
+  recovery; B stored it 83 seconds after publication and A after 96.5 seconds.
+  Local recovery announcements now bypass that background deferral and use an
+  existing 45-byte KC1K summary for unsigned history. A single-frame message less
+  than two minutes old and its page end use normal chat priority when repaired;
+  larger/older history remains bulk traffic. Added explicit local/stored message
+  debug events for matching latency across station logs. No new latency benchmark
+  or tests were run for these changes; the old timings are the diagnostic baseline.
+  The conversation now rebuilds in timestamp order, highlights newly arrived
+  messages with a 12-second fading background, and retains the reading position
+  while scrolled up. Nicknames and a legend distinguish local/direct/relayed/unknown.
+  Raw AX.25 source and used digipeater paths are retained per fragment, aggregated
+  when assembled and persisted with the message; source-to-node associations come
+  from directly transmitted inventories/summaries. Old history and transports
+  without source metadata stay unknown. Rendering and live behavior remain unverified.
+
+- 2026-10-21 thumbnail follow-up: the live trace showed C at 23/45 chunks,
+  while A had queued its 45 original chunks plus returning relay copies and C
+  emitted many simultaneous repair requests. Senders now register outgoing
+  chunks for echo suppression and avoid rebuilding already-cached images as
+  partial transfers. Explicit downloads advance in windows of up to eight chunks,
+  reduced as needed to fit one request frame;
+  the initial response has a 45-second allowance for routed claims, then
+  claims/new chunks reset a 20-second silence timer. Repairs request only the
+  active window's missing chunks, and the overall expiry stays fixed. The
+  requester sends background announcements at window boundaries and stops
+  relaying claims addressed to itself. A complete cache serves a request without
+  flooding it farther. Every listener with metadata still stores overheard
+  chunks and now receives progress/completion UI events; passive listeners do
+  not initiate downloads. Added noise-image fixtures because the old solid-color
+  JPEG had only three chunks. A 44-chunk line trial verified identical completed
+  images at C and non-requesting B. The dropped-chunk fixture also verifies B's
+  passive cached copy and rejects repair requests for already-received chunks.
+  The 44-test unit suite passes, including
+  selective window repair, passive display notification, and sender suppression.
+  A local run through actual KISS/TCP sockets with simultaneous chat and an
+  eight-chunk image completed in 100.5s: A, B and C cached identical bytes, every
+  chat message arrived, and peak application queues were 6/2/3 records. Chat
+  convergence at the far station still took 96.5s under hidden-terminal
+  contention; this is a remaining latency concern, not RF validation. The status
+  timer also now tolerates its Textual screen being unmounted during shutdown.
+
+- 2026-10-21: traced the interactive line-mesh congestion to flooded neighbor
+  queries/inventories, duplicate announcements, unconditional unsigned-proof
+  probes, synchronized retries, and manifest-only retries even when no data had
+  arrived. A separate reproduced expiry race deleted a due page request when
+  another inventory arrived, leaving its window blocked for five minutes with
+  nothing left to retry. Due requests now survive both inventory and routine-sync
+  cleanup. Routine history exchange now stays between neighbors; caches propagate
+  messages by advertising their own stored copy. Queries use the existing compact
+  binary repair record, inventories carry optional proof availability, and page
+  retries use jitter and a silence timer. A lost query retries data directly;
+  cached fragments still use manifest/selective repair. Debug traces distinguish
+  queue acceptance from modem submission and include bridge connection events.
+  Added `--auto-sync` to the scripted simulator because its previous default
+  disabled the background traffic used by live clients. In a three-message,
+  zero-loss line trial, the old automatic path failed convergence after 94s
+  (57 frames/35 collision losses over 97s including drain); the first patched
+  trial converged (23 frames/2 collision losses). Separate automatic trials passed
+  at the default contention window and with 10% injected loss. An actual local
+  KISS/TCP run after retry repair delivered all three messages at all stations in
+  57.5s, with empty client transmit queues. These are observed simulator runs,
+  not a latency guarantee: random backoff/thread timing varies, and hidden-terminal
+  latency remains material. The 32-test unittest suite passes. RF behavior and
+  the updated interactive windows still require a fresh live run.
+
 - Added a Textual interaction regression for the actual image attachment modal.
   At 48×24, 80×24, 100×30 and 160×45 it checks both action labels and that
   their rendered regions remain inside the screen; it also exercises path Enter,

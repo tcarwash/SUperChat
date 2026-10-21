@@ -47,6 +47,12 @@ class Store:
             CREATE INDEX IF NOT EXISTS messages_channel_time ON messages(channel,ts);
             CREATE INDEX IF NOT EXISTS messages_recent_inventory ON messages(ts,origin,seq);
             CREATE INDEX IF NOT EXISTS messages_origin_recent ON messages(origin,ts,seq);
+            CREATE TABLE IF NOT EXISTS origin_stations (
+              origin TEXT PRIMARY KEY, callsign TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS message_reception (
+              origin TEXT NOT NULL, seq INTEGER NOT NULL, source TEXT NOT NULL,
+              relayed INTEGER NOT NULL, known INTEGER NOT NULL,
+              PRIMARY KEY(origin,seq));
             CREATE TABLE IF NOT EXISTS fragments (
               origin TEXT NOT NULL, seq INTEGER NOT NULL, idx INTEGER NOT NULL,
               count INTEGER NOT NULL, channel TEXT NOT NULL, nick TEXT NOT NULL,
@@ -147,6 +153,10 @@ class Store:
                                 "INTEGER NOT NULL DEFAULT 0")
             fragment_columns = {row["name"] for row in
                                 self.db.execute("PRAGMA table_info(fragments)")}
+            if "rx_source" not in fragment_columns:
+                self.db.execute("ALTER TABLE fragments ADD COLUMN rx_source TEXT NOT NULL DEFAULT ''")
+            if "rx_repeated" not in fragment_columns:
+                self.db.execute("ALTER TABLE fragments ADD COLUMN rx_repeated INTEGER NOT NULL DEFAULT 0")
             if "chunk_size" not in fragment_columns:
                 self.db.execute("ALTER TABLE fragments ADD COLUMN chunk_size "
                                 "INTEGER NOT NULL DEFAULT 120")
@@ -269,7 +279,7 @@ class Store:
             self.seq = seq
             return message
 
-    def add_fragment(self, part: dict) -> tuple[dict, bool] | None:
+    def add_fragment(self, part: dict, reception: dict | None = None) -> tuple[dict, bool] | None:
         """Persist a fragment; return a complete message and whether it is new."""
         origin, seq, index, count = part["o"], int(part["s"]), int(part["i"]), int(part["z"])
         chunk = part["b"]
@@ -316,14 +326,16 @@ class Store:
                 new_transfer = True
             self.db.execute(
                 "INSERT OR IGNORE INTO fragments "
-                "(origin,seq,idx,count,channel,nick,ts,body,chunk_size) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "(origin,seq,idx,count,channel,nick,ts,body,chunk_size,rx_source,rx_repeated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (origin, seq, index, count, channel, nick, int(part["ts"]),
-                 chunk, chunk_size))
+                 chunk, chunk_size, (reception or {}).get("source", ""),
+                 int(bool((reception or {}).get("repeated")))))
             if new_transfer:
                 self._bound_partial_transfers("fragments", origin, seq)
             rows = self.db.execute(
-                "SELECT idx,body FROM fragments WHERE origin=? AND seq=? ORDER BY idx",
+                "SELECT idx,body,rx_source,rx_repeated FROM fragments "
+                "WHERE origin=? AND seq=? ORDER BY idx",
                 (origin, seq)).fetchall()
             if len(rows) != count:
                 self.db.commit()
@@ -347,10 +359,47 @@ class Store:
                                      (origin, seq, message["c"], message["n"],
                                       message["ts"], body))
             if cursor.rowcount == 1:
+                sources = {row["rx_source"] for row in rows if row["rx_source"]}
+                self.db.execute(
+                    "INSERT OR REPLACE INTO message_reception VALUES(?,?,?,?,?)",
+                    (origin, seq, next(iter(sources)) if len(sources) == 1 else "",
+                     int(len(sources) > 1 or any(row["rx_repeated"] for row in rows)),
+                     int(all(row["rx_source"] for row in rows))))
                 self._advance_contiguous_locked(origin)
                 self._increment_message_count_locked()
             self.db.commit()
             return message, cursor.rowcount == 1
+
+    def note_origin_station(self, origin: str, callsign: str) -> bool:
+        with self.lock:
+            previous = self.db.execute("SELECT callsign FROM origin_stations WHERE origin=?",
+                                       (origin,)).fetchone()
+            if previous and previous[0] == callsign:
+                return False
+            self.db.execute("INSERT OR REPLACE INTO origin_stations VALUES(?,?)",
+                            (origin, callsign))
+            self.db.commit()
+            return True
+
+    def reception_for(self, origin: str, seq: int) -> str:
+        """Classify retained first-copy evidence, without guessing unknown paths."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT r.source,r.relayed,r.known,s.callsign FROM message_reception r "
+                "LEFT JOIN origin_stations s ON s.origin=r.origin "
+                "WHERE r.origin=? AND r.seq=?", (origin, seq)).fetchone()
+            if not row:
+                return "unknown"
+            if row["relayed"]:
+                return "relayed"
+            if not row["known"]:
+                return "unknown"
+            if row["callsign"]:
+                return "direct" if row["source"] == row["callsign"] else "relayed"
+            other = self.db.execute(
+                "SELECT 1 FROM origin_stations WHERE callsign=? AND origin<>? LIMIT 1",
+                (row["source"], origin)).fetchone()
+            return "relayed" if other else "unknown"
 
     def highwater(self, origin: str, since: int | None = None) -> int:
         with self.lock:
@@ -384,6 +433,14 @@ class Store:
         count = counts.pop()
         received = {int(row["idx"]) for row in rows}
         return sum(1 << index for index in range(count) if index not in received)
+
+    def has_history_data(self, origin: str, after: int, through: int) -> bool:
+        """Whether a page has any complete messages or retained fragments."""
+        with self.lock:
+            return self.db.execute(
+                "SELECT 1 FROM messages WHERE origin=? AND seq>? AND seq<=? "
+                "UNION ALL SELECT 1 FROM fragments WHERE origin=? AND seq>? AND seq<=? LIMIT 1",
+                (origin, after, through, origin, after, through)).fetchone() is not None
 
     def _scan_contiguous_locked(self, origin: str) -> int:
         """Build the initial high-water value for a history already on disk."""
@@ -571,6 +628,12 @@ class Store:
                                   (origin, seq)).fetchone()
             return bytes(row[0]) if row and row[0] is not None else None
 
+    def has_proofs(self, origin: str) -> bool:
+        with self.lock:
+            return self.db.execute(
+                "SELECT 1 FROM message_auth WHERE origin=? AND proof IS NOT NULL LIMIT 1",
+                (origin,)).fetchone() is not None
+
     def pending_local_signatures(self, origin: str, limit: int = 32) -> list[dict]:
         """Return committed local messages whose requested signature is unfinished."""
         with self.lock:
@@ -641,6 +704,22 @@ class Store:
         with self.lock:
             row = self.db.execute("SELECT origin,seq,digest,size,width,height FROM attachments "
                                   "WHERE origin=? AND seq=?", (origin, seq)).fetchone()
+            return dict(row) if row else None
+
+    def next_attachment_announcement(self, since: int, *, origin: str | None = None,
+                                    after: tuple[str, int] = ("", 0)) -> dict | None:
+        """One bounded metadata advertisement, independent of message highwater."""
+        with self.lock:
+            query = ("SELECT a.* FROM attachments a JOIN messages m USING(origin,seq) "
+                     "WHERE m.ts>=? AND m.ts<=? ")
+            params = [since, int(time.time())]
+            if origin is not None:
+                query += "AND a.origin=? ORDER BY a.seq DESC LIMIT 1"
+                params.append(origin)
+            else:
+                query += "AND (a.origin,a.seq)>(?,?) ORDER BY a.origin,a.seq LIMIT 1"
+                params.extend(after)
+            row = self.db.execute(query, params).fetchone()
             return dict(row) if row else None
 
     def find_attachment(self, prefix: str, seq: int) -> dict | None:
@@ -803,7 +882,7 @@ class Store:
             for table in ("messages", "unread_messages", "fragments",
                           "mention_receipts", "receipt_relay", "message_auth",
                           "proof_fragments", "attachments", "attachment_blobs",
-                          "image_fragments"):
+                          "image_fragments", "message_reception"):
                 self.db.execute(f"DELETE FROM {table}")
             self.db.execute("DELETE FROM origin_highwater")
             # The local sequence continues after purge. Treat that prefix as
@@ -878,11 +957,11 @@ class Store:
                 not valid_mention_name(mention)):
             return False
         with self.lock:
-            self.db.execute(
+            cursor = self.db.execute(
                 "INSERT OR IGNORE INTO receipt_relay(origin,seq,recipient_id,nick,mention,received_at) "
                 "VALUES(?,?,?,?,?,?)", (origin, seq, recipient_id, nick, mention, received_at))
             self.db.commit()
-            return True
+            return cursor.rowcount == 1
 
     def claim_pending_receipts(self, now: int, limit: int = 20) -> list[dict]:
         """Return due receipts and persist bounded retry backoff before sending."""
@@ -912,6 +991,14 @@ class Store:
                 params += (mention,)
             self.db.execute(query, params)
             self.db.commit()
+
+    def has_relay_receipt(self, origin: str, seq: int, recipient_id: str,
+                          mention: str) -> bool:
+        with self.lock:
+            return self.db.execute(
+                "SELECT 1 FROM receipt_relay WHERE origin=? AND seq=? "
+                "AND recipient_id=? AND mention=?",
+                (origin, seq, recipient_id, mention)).fetchone() is not None
 
     def channels(self) -> list[str]:
         with self.lock:

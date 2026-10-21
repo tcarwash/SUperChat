@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlparse
 
 from rich.text import Text
 from rich.console import Group
+from rich.padding import Padding
 from rich.markup import escape
 from rich.style import Style
 from rich.syntax import Syntax
@@ -33,6 +34,7 @@ from .mentions import (BARE_MENTION, MENTION, MENTION_RE, format_mention,
 
 
 IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+MESSAGE_HIGHLIGHT_SECONDS = 12
 
 
 def _image_path_from_paste(text: str) -> str | None:
@@ -435,6 +437,11 @@ class ChatApp(App[None]):
         self.search_query: str | None = None
         self.displayed_messages: set[tuple[str, int]] = set()
         self.displayed_day: tuple[int, int] | None = None
+        self.new_message_times: dict[tuple[str, int], float] = {}
+        self.message_line_offsets: dict[tuple[str, int], int] = {}
+        self.message_render_cache: dict[tuple[str, int], object] = {}
+        self.message_render_search: str | None = None
+        self.cleared_messages: set[tuple[str, int]] = set()
         self.last_status = "Broadcast link ready"
 
     def compose(self) -> ComposeResult:
@@ -448,6 +455,10 @@ class ChatApp(App[None]):
                 yield Button("＋  Join channel", id="join-channel", variant="default")
                 yield Static("HISTORY", classes="eyebrow section-label")
                 yield Static("Synced between stations\nStored on this device", id="history-note")
+                yield Static(Text.assemble(
+                    ("● You\n", "#c4b5fd"), ("● Direct\n", "#8bd5ca"),
+                    ("↪ Relayed\n", "#e7b774"), ("? Path unknown", "#a8b2c3")),
+                    id="message-legend")
             with Vertical(id="conversation", classes="panel"):
                 with Horizontal(id="room-header"):
                     yield Static(self.channel, id="room-name")
@@ -478,6 +489,8 @@ class ChatApp(App[None]):
                 yield Button("↓  Request selected", id="request-image", variant="default")
                 yield Static("MESH SYNC", classes="eyebrow section-label")
                 yield Static("History relays on\nNo central server", id="sync-card")
+                yield Static("TRANSMIT", classes="eyebrow section-label")
+                yield Static("● IDLE · no frames queued", id="tx-state")
                 yield Static("ACTIVITY", classes="eyebrow section-label")
                 yield Static(self.last_status, id="activity")
         yield Footer()
@@ -495,6 +508,7 @@ class ChatApp(App[None]):
         self._refresh_channels()
         self._load_messages()
         self.set_interval(0.15, self._drain_events)
+        self.set_interval(1, self._fade_new_messages)
         self.query_one("#composer", Input).focus()
         self._refresh_stations()
         self._refresh_images()
@@ -581,6 +595,7 @@ class ChatApp(App[None]):
         composer.value = self.channel_drafts.get(channel, "")
         self.chat.store.clear_unread(channel)
         self.search_query = None
+        self.cleared_messages.clear()
         self.history_limit = 200
         self.unread.pop(channel, None)
         self.unread_mentions.pop(channel, None)
@@ -607,6 +622,7 @@ class ChatApp(App[None]):
             self.query_one("#composer", Input).focus()
             return
         self.search_query = query.strip() or None
+        self.cleared_messages.clear()
         self.history_limit = 200
         self._load_messages()
         self._refresh_images()
@@ -632,7 +648,10 @@ class ChatApp(App[None]):
 
     def action_clear_messages(self) -> None:
         self.query_one("#messages", RichLog).clear()
+        self.cleared_messages.update(self.displayed_messages)
         self.displayed_messages.clear()
+        self.new_message_times.clear()
+        self.message_line_offsets.clear()
         self.displayed_day = None
         self.last_status = "View cleared · use /history to reload"
         self.query_one("#activity", Static).update(self._short_status(self.last_status))
@@ -674,6 +693,7 @@ class ChatApp(App[None]):
                 except ValueError:
                     count = 30
                 self.history_limit = count
+                self.cleared_messages.clear()
                 self._load_messages()
                 self._refresh_images()
             self._refresh_channels()
@@ -693,24 +713,45 @@ class ChatApp(App[None]):
             self.chat.command(f"/image-get {image['origin']}:{image['seq']}")
         self.query_one("#composer", Input).focus()
 
-    def _load_messages(self) -> None:
+    def _load_messages(self, *, preserve_scroll: bool = False) -> None:
         feed = self.query_one("#messages", RichLog)
+        if self.message_render_search != self.search_query:
+            self.message_render_cache.clear()
+            self.message_render_search = self.search_query
+        old_y = feed.scroll_y
+        follow = not preserve_scroll or feed.is_vertical_scroll_end
+        anchor = None
+        if preserve_scroll and not follow:
+            for identity, line in self.message_line_offsets.items():
+                if line <= old_y:
+                    anchor = (identity, old_y - line)
+        self.message_line_offsets.clear()
         feed.clear()
         if self.search_query:
             messages = self.chat.store.search_history(self.channel, self.search_query,
                                                      self.history_limit)
         else:
             messages = self.chat.store.history(self.channel, self.history_limit)
+        messages = [message for message in messages
+                    if (message["o"], int(message["s"])) not in self.cleared_messages]
         self.displayed_messages = {(message["o"], int(message["s"]))
                                    for message in messages}
+        self.message_render_cache = {key: value for key, value in self.message_render_cache.items()
+                                     if key in self.displayed_messages}
         self.displayed_day = None
         for message in messages:
             day, marker = self._day_marker(int(message["ts"]))
             if day != self.displayed_day:
                 feed.write(marker, scroll_end=False)
                 self.displayed_day = day
+            self.message_line_offsets[(message["o"], int(message["s"]))] = len(feed.lines)
             feed.write(self._message_renderable(message), scroll_end=False)
-        feed.scroll_end(animate=False)
+        if follow:
+            feed.scroll_end(animate=False)
+        else:
+            if anchor and anchor[0] in self.message_line_offsets:
+                old_y = self.message_line_offsets[anchor[0]] + anchor[1]
+            feed.scroll_to(y=old_y, animate=False)
         total = (self.chat.store.search_count(self.channel, self.search_query)
                  if self.search_query else self.chat.store.history_count(self.channel))
         meta = self.query_one("#room-meta", Static)
@@ -729,6 +770,16 @@ class ChatApp(App[None]):
         else:
             control.label = (f"↑ Load older · {loaded}/{total}" if loaded < total
                              else f"✓ All history · {total}")
+
+    def _fade_new_messages(self) -> None:
+        if not self.is_mounted or not self.new_message_times:
+            return
+        now = time.monotonic()
+        visible = bool(self.displayed_messages.intersection(self.new_message_times))
+        self.new_message_times = {key: stamp for key, stamp in self.new_message_times.items()
+                                  if now - stamp < MESSAGE_HIGHLIGHT_SECONDS}
+        if visible:
+            self._load_messages(preserve_scroll=True)
 
     @staticmethod
     def _day_marker(timestamp: int) -> tuple[tuple[int, int], Text]:
@@ -847,12 +898,16 @@ class ChatApp(App[None]):
             pieces.append(cls._render_inline_body(body))
         return pieces
 
-    def _message_renderable(self, message: dict):
+    def _message_content(self, message: dict):
         stamp = time.strftime("%H:%M", time.localtime(int(message["ts"])))
         local = message["o"] == self.chat.store.node
         text = Text()
         text.append(f"{stamp}  ", style="#718096")
-        text.append(message["n"], style="bold #c4b5fd" if local else "bold #8bd5ca")
+        path = "local" if local else self.chat.store.reception_for(message["o"], int(message["s"]))
+        color, symbol = {"local": ("#c4b5fd", "●"), "direct": ("#8bd5ca", "●"),
+                         "relayed": ("#e7b774", "↪"),
+                         "unknown": ("#a8b2c3", "?")}[path]
+        text.append(f"{symbol} {message['n']}", style=f"bold {color}")
         text.append("  ", style="#65748b")
         body = str(message["b"])
         parts: list[Text | Syntax] = [text]
@@ -920,32 +975,45 @@ class ChatApp(App[None]):
             parts.append(render_thumbnail(thumbnail))
         return parts[0] if len(parts) == 1 else Group(*parts)
 
+    def _message_renderable(self, message: dict):
+        identity = (message["o"], int(message["s"]))
+        # Fading changes only the background. Keep image/body rendering and
+        # durable status queries out of repeated animation updates.
+        rendered = self.message_render_cache.get(identity)
+        if rendered is None:
+            rendered = self._message_content(message)
+            self.message_render_cache[identity] = rendered
+        arrived = self.new_message_times.get((message["o"], int(message["s"])))
+        if arrived is not None:
+            strength = max(0, 1 - (time.monotonic() - arrived) / MESSAGE_HIGHLIGHT_SECONDS)
+            if strength:
+                base, bright = (11, 17, 27), (36, 57, 72)
+                background = '#' + ''.join(f'{round(a + (b - a) * strength):02x}'
+                                            for a, b in zip(base, bright))
+                return Padding(rendered, 0, style=Style(bgcolor=background))
+        return rendered
+
     def _drain_events(self) -> None:
         # Textual may run an already-scheduled interval once while the app is
         # being detached. The screen is no longer available for UI updates.
         if not self.is_mounted:
             return
         changed_channels = False
+        changed_messages = False
         image_progress_changed = False
         while True:
             try:
                 event, value = self.chat.events.get_nowait()
             except queue.Empty:
                 break
+            if event in {"receipt", "auth", "auth-policy", "image", "attachment",
+                         "reception", "refresh"}:
+                self.message_render_cache.clear()
             if event == "message":
+                identity = (value["o"], int(value["s"]))
+                self.new_message_times.setdefault(identity, time.monotonic())
                 if value["c"] == self.channel:
-                    if self.search_query:
-                        self._load_messages()
-                    else:
-                        identity = (value["o"], int(value["s"]))
-                        if identity not in self.displayed_messages:
-                            feed = self.query_one("#messages", RichLog)
-                            day, marker = self._day_marker(int(value["ts"]))
-                            if day != self.displayed_day:
-                                feed.write(marker)
-                                self.displayed_day = day
-                            feed.write(self._message_renderable(value))
-                            self.displayed_messages.add(identity)
+                    changed_messages = True
                 else:
                     channel = value["c"]
                     unread = self.chat.store.unread_summary(channel)
@@ -958,16 +1026,14 @@ class ChatApp(App[None]):
                 changed_channels = True
                 self._refresh_images()
                 self._refresh_stats()
+            elif event == "reception":
+                changed_messages = True
             elif event == "receipt":
-                self._load_messages()
-                self.query_one("#messages", RichLog).write(
-                    Text(f"✓ {format_mention(value['m'])} received by {value['n']}  ·  "
-                         f"message #{value['s']}",
-                         style="bold #79d7b2"))
+                changed_messages = True
                 self.last_status = f"{format_mention(value['m'])} received by {value['n']}"
                 self.query_one("#activity", Static).update(self.last_status)
             elif event == "auth":
-                self._load_messages()
+                changed_messages = True
                 if value["status"] == "verified":
                     self.last_status = f"Verified message from {value['signer']}"
                 elif value["status"] == "invalid":
@@ -980,12 +1046,13 @@ class ChatApp(App[None]):
                     self.last_status = f"Signature from {value['signer']} is not trusted"
                 self.query_one("#activity", Static).update(self._short_status(self.last_status))
             elif event == "auth-policy":
-                self._load_messages()
+                changed_messages = True
                 count = int(value.get("count", 0))
                 self.last_status = f"ARAP policy changed; checking {count} signed messages"
                 self.query_one("#activity", Static).update(self._short_status(self.last_status))
             elif event in {"image", "attachment"}:
-                self._load_messages()
+                changed_messages = True
+                self._refresh_images()
                 if event == "image":
                     self.last_status = "Requested thumbnail received"
                     self.query_one("#activity", Static).update(self.last_status)
@@ -1035,9 +1102,39 @@ class ChatApp(App[None]):
                     link_state.update("● ONLINE")
         if changed_channels:
             self._refresh_channels()
+        if changed_messages:
+            self._load_messages(preserve_scroll=True)
         if image_progress_changed:
             self._refresh_images()
         self._refresh_stations()
+        self._refresh_tx_state()
+
+    def _refresh_tx_state(self) -> None:
+        snapshot = self.chat.data.transmit_snapshot()
+        queued = snapshot["queued"]
+        waiting = snapshot["pending_acks"]
+        state = snapshot["state"]
+        if state != "idle":
+            label = f"● {state} · {snapshot['age']}s"
+            style = "bold #ffb86c" if state == "write failed" else "#d2ae67"
+        elif queued:
+            label = f"● QUEUED · {queued} frame{'s' if queued != 1 else ''}"
+            style = "bold #ffb86c"
+        elif waiting:
+            label = (f"● HOST RECEIPT · {waiting} pending · "
+                     f"oldest {snapshot['oldest_ack']}s\nRF delivery unconfirmed")
+            style = "#d2ae67"
+        elif snapshot["transport"] == "ax25" and snapshot["last_submit"]:
+            elapsed = max(0, int(time.monotonic() - snapshot["last_submit"]))
+            label = f"● SUBMITTED TO KISS · {elapsed}s ago\nRF delivery unconfirmed"
+            style = "#a9d8c5"
+        else:
+            label = "● IDLE · no frames queued"
+            style = "#79d7b2"
+        # The periodic callback can run while its screen is unmounting.
+        widgets = self.query("#tx-state")
+        if widgets:
+            widgets.first(Static).update(Text(label, style=style))
 
     def _short_status(self, value: str) -> str:
         return value if len(value) <= 72 else value[:69] + "…"

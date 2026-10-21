@@ -24,13 +24,17 @@ from .store import Store
 from .images import make_thumbnail
 from .mentions import MENTION, format_mention, mention_name
 import hashlib
+from datetime import datetime, timezone
 
 
 CHANNEL = re.compile(r"^#[A-Za-z0-9_-]{1,31}$")
 NODE_ID = re.compile(r"^[0-9a-f]{32}$")
 SYNC_PAGE_MESSAGES = 8
 SYNC_PAGE_REPAIR_LIMIT = 3
-SYNC_REQUEST_RETRY_SECONDS = 90
+# A lost broadcast request or page end should recover on a useful chat
+# timescale. Retries are bounded and back off, so this does not become a
+# continuous source of radio traffic.
+SYNC_REQUEST_RETRY_SECONDS = 12
 MAX_SYNC_REQUEST_RETRIES = 3
 SYNC_HISTORY_SECONDS = 48 * 60 * 60
 AUTO_SYNC_INTERVAL_SECONDS = 45
@@ -47,6 +51,12 @@ MAX_IMAGE_REQUESTS = 4096
 MAX_IMAGE_CHUNKS_SEEN = 4096
 MAX_IMAGE_RESPONSE_TIMERS = 512
 MAX_PENDING_IMAGES = 512
+IMAGE_REQUEST_WINDOW = 8
+IMAGE_RESPONSE_SECONDS = 45
+# Reset this silence timer on claims and chunks within each bounded turn.
+IMAGE_RETRY_SECONDS = 20
+# Bound the fast repair path to one recent short message per response.
+LIVE_MESSAGE_REPAIR_SECONDS = 120
 MAX_PENDING_AUTH_JOBS = 128
 MAX_SEEN_RECEIPT_ACKS = 8192
 MAX_UI_EVENTS = 1024
@@ -78,9 +88,11 @@ class ChatEventQueue:
 class Chat:
     def __init__(self, args):
         self.args = args
-        # Broadcast history exchange is opt-in for an interactive session.
-        # Headless relay deployments automatically keep their history moving.
-        self.auto_sync = bool(getattr(args, "auto_sync", False) or
+        self.debug_log_lock = threading.Lock()
+        # Interactive clients periodically repair messages missed during
+        # simultaneous radio transmissions. Operators can disable that airtime
+        # use explicitly; headless relays always keep history moving.
+        self.auto_sync = bool(getattr(args, "auto_sync", True) or
                               getattr(args, "headless", False))
         callsign = str(args.callsign).upper()
         if (not 1 <= len(callsign) <= 10 or
@@ -131,6 +143,7 @@ class Chat:
         self.peer_names: dict[str, str] = {}
         self.peer_nicks: dict[str, str] = {}
         self.peer_last_seen: dict[str, float] = {}
+        self.peer_proofs: dict[tuple[str, str], bool] = {}
         self.cq_frames: dict[str, float] = {}
         self.peer_lock = threading.RLock()
         self.pending: dict[tuple[str, str, int], float] = {}
@@ -151,6 +164,7 @@ class Chat:
         # The first request remains explicit; retries never start for an image
         # the operator has not selected.
         self.pending_images: dict[tuple[str, int, str], tuple[int, float, float]] = {}
+        self.image_windows: dict[tuple[str, int, str], set[int]] = {}
         self.image_lock = threading.RLock()
         self.seen_routes: dict[tuple, tuple[int, float]] = {}
         self.route_lock = threading.RLock()
@@ -163,6 +177,7 @@ class Chat:
         self.pending_announcements: dict[str, float] = {}
         self.announce_lock = threading.Lock()
         self.inventory_cursor = 0
+        self.attachment_cursor: tuple[str, int] = ("", 0)
         self.inventory_lock = threading.Lock()
         self.sync_stop = threading.Event()
         self.sync_thread: threading.Thread | None = None
@@ -178,7 +193,9 @@ class Chat:
                            ax25_baud=getattr(args, "ax25_baud", 1200),
                            ax25_interframe_delay=getattr(args, "ax25_interframe_delay", 0.25),
                            on_frame=self._on_frame,
-                           on_status=self._on_data_status)
+                           on_frame_context=self._on_frame,
+                           on_status=self._on_data_status,
+                           on_debug=self._debug_log if getattr(args, "debug_log", "") else None)
 
     def station_names(self) -> list[str]:
         with self.peer_lock:
@@ -209,6 +226,21 @@ class Chat:
         self.events.put(("status", f"Connecting to {self.args.host}; "
                          f"station {self.args.callsign}"))
 
+    def _debug_log(self, event: str, detail: object) -> None:
+        path = getattr(self.args, "debug_log", "")
+        if not path:
+            return
+        stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        line = f"{stamp} {self.args.callsign} {event} {detail}\n"
+        try:
+            with self.debug_log_lock, open(path, "a", encoding="utf-8") as stream:
+                stream.write(line)
+                stream.flush()
+        except OSError as exc:
+            # Preserve the diagnostic failure in the terminal instead of
+            # silently losing the requested trace.
+            print(f"debug log {path}: {exc}", flush=True)
+
     def _recover_mention_receipts(self):
         """Restore any receipt lost between committing a message and its ack."""
         received_at = int(time.time())
@@ -221,6 +253,7 @@ class Chat:
                                              mention, received_at)
 
     def _on_data_status(self, value: str):
+        self._debug_log("STATUS", value)
         self.events.put(("status", value))
         connected_status = (value.startswith("Connected to Data2G at ") or
                             value.startswith("Connected to raw KISS TNC at "))
@@ -247,7 +280,7 @@ class Chat:
         if value.startswith("ARQ connected"):
             self.sync()
 
-    def sync(self, *, retry: bool = False):
+    def sync(self, *, retry: bool = False, discover: bool = True):
         """Advertise local history and ask nearby stations for their inventories."""
         if self.args.transport == "connected" and not self.data.session_event.is_set():
             return
@@ -263,23 +296,24 @@ class Chat:
                 self.sync_repair_attempts.clear()
             for pending in (self.pending, self.pending_proofs):
                 for key, expiry in list(pending.items()):
-                    if expiry <= now:
+                    if (expiry <= now and not
+                            (pending is self.pending and key in self.pending_sync_requests)):
                         pending.pop(key, None)
         self._forward_pending_receipts()
         # Repair deferred signatures only when history sync is requested or
         # scheduled. Interactive clients otherwise remain quiet on first connect.
         self._retry_pending_signatures()
         self.announce()
-        self._send_routed_record({"t": "w", "p": self.store.node, "v": 2, "ttl": 4},
-                                 ("w", self.store.node, 2))
+        if discover:
+            self._send_routed_record({"t": "w", "p": self.store.node, "v": 2, "ttl": 0},
+                                    ("w", self.store.node, 2))
         self.pending_local_delivery.clear()
 
     def _sync_loop(self):
-        # Relays are often started together after a modem or host reboot.
-        # Stagger each inventory exchange so they do not all contend for the
-        # same on-air slot, and choose a fresh offset for every cycle.
-        next_sync = (time.monotonic() + AUTO_SYNC_INTERVAL_SECONDS +
-                     secrets.randbelow(AUTO_SYNC_JITTER_SECONDS + 1))
+        # Give new clients a chance to discover peers quickly, but randomize
+        # their first inventory exchange so a group started together does not
+        # transmit in lockstep. Later exchanges use the normal longer interval.
+        next_sync = time.monotonic() + 2 + secrets.randbelow(29)
         next_auth_policy_check = time.monotonic() + 2
         while not self.sync_stop.wait(0.25):
             self._expire_peer_sightings()
@@ -292,8 +326,9 @@ class Chat:
                 self._refresh_auth_policy()
                 next_auth_policy_check = time.monotonic() + 2
             self._retry_pending_verifications()
-            if self.auto_sync and time.monotonic() >= next_sync:
-                self.sync()
+            if (self.auto_sync and time.monotonic() >= next_sync and
+                    not self._receiving_image_window()):
+                self.sync(discover=False)
                 next_sync = (time.monotonic() + AUTO_SYNC_INTERVAL_SECONDS +
                              secrets.randbelow(AUTO_SYNC_JITTER_SECONDS + 1))
 
@@ -318,6 +353,30 @@ class Chat:
     def announce(self, *, legacy: bool = False):
         with self.inventory_lock:
             self._announce_inventory(legacy=legacy)
+            self._announce_attachment_metadata()
+
+    def _announce_attachment_metadata(self, origin: str | None = None) -> None:
+        since = int(time.time()) - SYNC_HISTORY_SECONDS
+        after = self.attachment_cursor if origin is None else ("", 0)
+        attachment = self.store.next_attachment_announcement(since, origin=origin, after=after)
+        if attachment is None and origin is None and after != ("", 0):
+            attachment = self.store.next_attachment_announcement(since)
+        if attachment is None:
+            return
+        # Neighbor caches advertise their metadata in turn. No repeated flood
+        # and no thumbnail bytes are needed to repair an orphaned caption.
+        sent = self.send_record({"t": "a", "o": attachment["origin"],
+                                 "s": attachment["seq"], "h": attachment["digest"],
+                                 "b": attachment["size"], "w": attachment["width"],
+                                 "hgt": attachment["height"], "ttl": 0},
+                                priority=10 if origin is None else 0)
+        if sent and origin is None:
+            self.attachment_cursor = (attachment["origin"], int(attachment["seq"]))
+
+    def _proof_mask(self, origins) -> int:
+        return sum(1 << index for index, origin in enumerate(origins)
+                   if (origin == self.store.node and self.auth.enabled) or
+                   self.store.has_proofs(origin))
 
     def _announce_inventory(self, *, legacy: bool = False):
         since = int(time.time()) - SYNC_HISTORY_SECONDS
@@ -331,7 +390,8 @@ class Chat:
             for origin, low, high in inventory[:MAX_INVENTORY_FRAMES_PER_ANNOUNCE]:
                 sent = self.send_record({"t": "i", "p": self.store.node,
                                          "n": self.args.callsign, "nick": self.nick,
-                                         "o": origin, "a": low, "m": high, "ttl": 4},
+                                         "o": origin, "a": low, "m": high, "ttl": 4,
+                                         "sig": self._proof_mask([origin])},
                                         priority=10)
                 if not sent:
                     break
@@ -350,7 +410,8 @@ class Chat:
                 return False
             sent = self.send_record({"t": "i", "p": self.store.node,
                                      "n": self.args.callsign, "nick": self.nick,
-                                     "v": batch, "l": lows, "ttl": 4}, priority=10)
+                                     "v": batch, "l": lows, "ttl": 4,
+                                     "sig": self._proof_mask(item[0] for item in batch)}, priority=10)
             if not sent:
                 return False
             sent_entries += len(batch)
@@ -365,7 +426,8 @@ class Chat:
             candidate_lows = lows + [low]
             record = {"t": "i", "p": self.store.node,
                       "n": self.args.callsign, "nick": self.nick,
-                      "v": candidate, "l": candidate_lows, "ttl": 4}
+                      "v": candidate, "l": candidate_lows, "ttl": 4,
+                      "sig": self._proof_mask(item[0] for item in candidate)}
             try:
                 pack(record)
             except ValueError:
@@ -383,7 +445,8 @@ class Chat:
             flush_batch()
         self.inventory_cursor = (start + sent_entries) % len(inventory)
 
-    def announce_origin(self, origin: str, *, force: bool = False, high: int | None = None):
+    def announce_origin(self, origin: str, *, force: bool = False,
+                        high: int | None = None, compact: bool = False):
         since = int(time.time()) - SYNC_HISTORY_SECONDS
         bounds = self.store.recent_bounds(origin, since)
         if bounds is None:
@@ -400,12 +463,25 @@ class Chat:
                 self.last_announced.pop(next(iter(self.last_announced)))
         if high is None:
             high = self.store.highwater(origin)
-        sent = self.send_record({"t": "i", "p": self.store.node, "n": self.args.callsign,
-                                 "nick": self.nick, "o": origin, "a": low,
-                                 "m": high, "ttl": 4})
+        proof_mask = self._proof_mask([origin])
+        if compact and not proof_mask:
+            # A local live-message recovery hint needs only history bounds.
+            # Keep full periodic inventories for station labels and signature
+            # discovery; use the existing KC1K format for this short hint.
+            sent = self.send_record({"t": "k", "from": self.store.node,
+                                     "h": [[origin, low, high]]})
+        else:
+            sent = self.send_record({"t": "i", "p": self.store.node,
+                                     "n": self.args.callsign, "nick": self.nick,
+                                     "o": origin, "a": low, "m": high,
+                                     "ttl": 4, "sig": proof_mask})
         if not sent:
             with self.announce_lock:
                 self.last_announced.pop(origin, None)
+        else:
+            self._debug_log("ORIGIN_ANNOUNCE", {"o": origin, "low": low, "high": high,
+                                                 "compact": compact and not proof_mask})
+            self._announce_attachment_metadata(origin)
         return sent
 
     def _queue_relay_announcement(self, origin: str) -> None:
@@ -421,11 +497,17 @@ class Chat:
             jitter_ms = secrets.randbelow(RELAY_ANNOUNCE_JITTER_SECONDS * 1000 + 1)
             self.pending_announcements[origin] = now + jitter_ms / 1000
 
-    def _flush_relay_announcements(self) -> None:
+    def _flush_relay_announcements(self, *, image_boundary: bool = False) -> None:
+        receiving_image = not image_boundary and self._receiving_image_window()
         now = time.monotonic()
         due = []
         with self.announce_lock:
             for origin, deadline in list(self.pending_announcements.items()):
+                # An image must not hide recovery of a local chat message
+                # that collided. Background cache announcements still wait
+                # for a window boundary, and the normal rate limit applies.
+                if receiving_image and origin != self.store.node:
+                    continue
                 if deadline > now:
                     continue
                 last = self.last_announced.get(origin, 0)
@@ -436,7 +518,7 @@ class Chat:
                 self.pending_announcements.pop(origin, None)
                 due.append(origin)
         for origin in due:
-            if not self.announce_origin(origin):
+            if not self.announce_origin(origin, compact=origin == self.store.node):
                 with self.announce_lock:
                     retry_ms = secrets.randbelow(RELAY_ANNOUNCE_JITTER_SECONDS * 1000 + 1)
                     self.pending_announcements[origin] = (
@@ -563,20 +645,30 @@ class Chat:
 
     def _send_sync_request(self, record: dict, key: tuple, route: tuple) -> bool:
         """Queue a page query and retain it for bounded timeout retries."""
+        record = dict(record)
+        if not record.get("v") and not record.get("j") and not record.get("r"):
+            # KC1H already carries ordinary windows with an empty repair list.
+            # Avoid a ~200-byte JSON query for a ~74-byte binary request.
+            record.setdefault("h", [])
         now = time.monotonic()
         retry_seconds = getattr(self.args, "sync_retry_seconds",
                                 SYNC_REQUEST_RETRY_SECONDS)
-        retry_at = now + retry_seconds
+        # Hidden stations hear the same inventory at the same instant. Their
+        # retries must not stay synchronized after the first collision.
+        retry_delay = retry_seconds * (1 + secrets.randbelow(1001) / 2000)
+        retry_at = now + retry_delay
         with self.pending_lock:
-            tracked = self._track_pending(self.pending, key, now,
-                                          timeout=retry_seconds)
-            # _track_pending also expires and capacity-evicts entries. Drop
-            # their retry payloads at the same time so both maps stay bounded.
-            for old_key in list(self.pending_sync_requests):
-                if old_key not in self.pending:
-                    self.pending_sync_requests.pop(old_key, None)
-            if not tracked:
+            # A due retry is still active work. Generic TTL pruning used to
+            # delete it when another inventory arrived, leaving its window
+            # blocked for five minutes with no request left to retry.
+            for old_key, expiry in list(self.pending.items()):
+                if expiry <= now and old_key not in self.pending_sync_requests:
+                    self.pending.pop(old_key, None)
+            if key in self.pending_sync_requests or self.pending.get(key, 0) > now:
                 return False
+            if len(self.pending) >= MAX_PENDING_SYNC_REQUESTS:
+                return False
+            self.pending[key] = retry_at
             self.pending_sync_requests[key] = (dict(record), route, retry_at, 0)
         if self._send_routed_record(record, route):
             return True
@@ -610,7 +702,8 @@ class Chat:
                 next_attempt = attempts + 1
                 retry_seconds = getattr(self.args, "sync_retry_seconds",
                                         SYNC_REQUEST_RETRY_SECONDS)
-                next_retry = now + retry_seconds * (2 ** attempts)
+                delay = retry_seconds * (2 ** attempts)
+                next_retry = now + delay * (1 + secrets.randbelow(1001) / 2000)
                 self.pending_sync_requests[key] = (record, route, next_retry, next_attempt)
                 self.pending[key] = next_retry
                 due.append((key, record, route, next_attempt))
@@ -624,13 +717,29 @@ class Chat:
                                  current[1] == route and current[3] == attempt)
             if still_pending:
                 retry_record = dict(record)
-                if not record.get("r") and not record.get("v"):
+                if (not record.get("r") and not record.get("v") and
+                        self.store.has_history_data(record["o"], int(record.get("a", 0)),
+                                                    int(record.get("b", 0)))):
                     # The peer's previous page may have arrived while only its
                     # addressed end record was lost. Ask for the page manifest
                     # first, then selectively repair any missing fragments.
                     retry_record["j"] = True
+                    retry_record.pop("h", None)
                 retry_record["k"] = attempt
                 self._send_routed_record(retry_record, (*route, attempt))
+
+    def _note_sync_progress(self, origin: str, seq: int) -> None:
+        """Treat the page timer as a silence timeout while fragments arrive."""
+        now = time.monotonic()
+        seconds = getattr(self.args, "sync_retry_seconds", SYNC_REQUEST_RETRY_SECONDS)
+        deadline = now + seconds * (1 + secrets.randbelow(1001) / 2000)
+        with self.pending_lock:
+            for key, (record, route, retry_at, attempts) in list(self.pending_sync_requests.items()):
+                if (record.get("o") == origin and
+                        int(record.get("a", 0)) < seq <= int(record.get("b", 0))):
+                    retry_at = max(retry_at, deadline)
+                    self.pending_sync_requests[key] = (record, route, retry_at, attempts)
+                    self.pending[key] = retry_at
 
     @staticmethod
     def _bound_timed_map(mapping: dict, now: float, limit: int) -> None:
@@ -704,6 +813,8 @@ class Chat:
             signer=self.args.callsign if self.auth.enabled else "")
         image = message.get("image")
         seq = int(message["s"])
+        self._debug_log("MESSAGE_LOCAL", {"o": self.store.node, "s": seq,
+                                          "ts": timestamp})
         self.events.put(("message", message))
         delivery_queued = True
         for frame in message_parts(origin=self.store.node, seq=seq, channel=channel,
@@ -716,6 +827,17 @@ class Chat:
                 break
         if not delivery_queued:
             self.pending_local_delivery.set()
+        else:
+            # Piggyback a compact, bounded snapshot of recent history on every
+            # newly published message. Peers can request records we have while
+            # their next periodic inventory exchange is still pending.
+            since = int(time.time()) - SYNC_HISTORY_SECONDS
+            inventory = self.store.inventory(since)
+            start = seq % len(inventory) if inventory else 0
+            summary = (inventory[start:] + inventory[:start])[:8]
+            if summary:
+                self.send_record({"t": "k", "from": self.store.node,
+                                  "h": [list(item) for item in summary]})
         if image:
             self._send_attachment(message)
         if self.auth.enabled:
@@ -724,7 +846,10 @@ class Chat:
                 self._queue_signature(dict(message))
             except RuntimeError as exc:
                 self.events.put(("status", f"ARAP signing could not be queued: {exc}"))
-        self.announce_origin(self.store.node, force=True, high=seq)
+        # The message and its first inventory announcement can collide at a
+        # hidden-terminal relay. Re-advertise this origin once after the normal
+        # relay jitter so peers can fetch it without waiting for periodic sync.
+        self._queue_relay_announcement(self.store.node)
 
     def queue_image(self, path: str, caption: str = "") -> None:
         """Prepare and publish a thumbnail without blocking the chat UI."""
@@ -750,13 +875,28 @@ class Chat:
         finally:
             self.image_slots.release()
 
-    def _on_frame(self, port: int, payload: bytes):
+    def _on_frame(self, port: int, payload: bytes, reception: dict | None = None):
         if port != self.data.port:
             return
         record = unpack(payload)
         if not record:
+            self._debug_log("RX_INVALID", f"port={port} bytes={len(payload)}")
             return
+        self._debug_log("RX", record)
         kind = record.get("t")
+        if reception and reception.get("source"):
+            sender = (record.get("from") if kind == "k" else
+                      record.get("p") if kind == "i" and record.get("ttl") == 4 else None)
+            if isinstance(sender, str) and NODE_ID.fullmatch(sender):
+                if self.store.note_origin_station(sender, reception["source"]):
+                    self.events.put(("reception", None))
+        if kind == "k":
+            peer = str(record.get("from", ""))
+            if peer and peer != self.store.node:
+                for origin, low, high in record.get("h", []):
+                    self._handle_inventory_entry(peer, str(origin), int(low),
+                                                 int(high), ttl=4, probe_proofs=False)
+            return
         if kind == "p":
             ttl = int(record.get("ttl", 4))
             route_key = ("p", record["o"], int(record["s"]), int(record["i"]))
@@ -775,21 +915,16 @@ class Chat:
             now = time.monotonic()
             if record.get("ttl", 0) > 0 and record["to"] != self.store.node:
                 ttl = int(record["ttl"])
-                previous_ttl, expiry = self.seen_image_chunks.get(chunk_key, (-1, 0))
-                if expiry <= now or ttl > previous_ttl:
-                    self.seen_image_chunks[chunk_key] = (ttl, now + 600)
-                    self._bound_timed_map(self.seen_image_chunks, now,
-                                          MAX_IMAGE_CHUNKS_SEEN)
+                with self.image_lock:
+                    previous_ttl, expiry = self.seen_image_chunks.get(chunk_key, (-1, 0))
+                    forward = expiry <= now or ttl > previous_ttl
+                    if forward:
+                        self.seen_image_chunks[chunk_key] = (ttl, now + 600)
+                        self._bound_timed_map(self.seen_image_chunks, now,
+                                              MAX_IMAGE_CHUNKS_SEEN)
+                if forward:
                     self._forward_image_part(record)
-            body = self.store.add_image_fragment(record)
-            if record.get("to") == self.store.node:
-                identity = {"o": record["o"], "s": int(record["s"])}
-                self.events.put(("image-progress", identity))
-                if body is not None:
-                    with self.image_lock:
-                        self.pending_images.pop((record["o"], int(record["s"]),
-                                                 record["h"]), None)
-                    self.events.put(("image", identity))
+            self._receive_image_part(record)
             return
         if kind == "d":
             recipient = record.get("to", "")
@@ -801,10 +936,14 @@ class Chat:
                 else:
                     self._suppress_duplicate_message_relay(key, ttl)
                 return
-            result = self.store.add_fragment(record)
+            self._note_sync_progress(record["o"], int(record["s"]))
+            result = self.store.add_fragment(record, reception)
             if result:
                 message, inserted = result
                 if inserted:
+                    self._debug_log("MESSAGE_STORED", {"o": message["o"], "s": message["s"],
+                                                       "ts": message["ts"],
+                                                       "reception": reception or {}})
                     existing_proof = self.store.proof_for(message["o"], message["s"])
                     if existing_proof:
                         self._verify_stored_proof(message["o"], message["s"], existing_proof)
@@ -833,6 +972,7 @@ class Chat:
                     if existing:
                         self._verify_stored_proof(origin, seq, existing)
                     self.events.put(("attachment", {"o": origin, "s": seq}))
+                    self._queue_relay_announcement(origin)
             ttl = int(record.get("ttl", 4))
             route_key = ("a", recipient, origin, seq, digest)
             if (not recipient or recipient != self.store.node) and self._route_once(route_key, ttl):
@@ -877,6 +1017,9 @@ class Chat:
                             return
                     self._schedule_image_response(request_key, requester, attachment, body,
                                                   indexes)
+                    # A complete cache can satisfy this request. Flooding it
+                    # farther only recruits more responders and echoes it back.
+                    return
             if ttl > 0:
                 record["ttl"] = ttl - 1
                 self.send_record(record)
@@ -900,13 +1043,18 @@ class Chat:
                         claimant >= current[0]):
                     return
                 self.image_claims[request_key] = (claimant, now + 120)
+                download_key = (origin, seq, digest)
+                if requester == self.store.node and download_key in self.pending_images:
+                    attempt, _, expires = self.pending_images[download_key]
+                    self.pending_images[download_key] = (attempt, now + IMAGE_RETRY_SECONDS,
+                                                         expires)
                 self._bound_timed_map(self.image_claims, now, MAX_IMAGE_REQUESTS)
                 timer = self.image_response_timers.get(request_key)
                 if timer and claimant != self.store.node:
                     timer.cancel()
                     self.image_response_timers.pop(request_key, None)
             ttl = int(record.get("ttl", 0))
-            if ttl > 0:
+            if ttl > 0 and requester != self.store.node:
                 record["ttl"] = ttl - 1
                 self.send_record(record)
         elif kind == "i":
@@ -932,6 +1080,7 @@ class Chat:
                     nick = name
                 self.peer_nicks[peer] = nick
             entries = record.get("v")
+            signature_indexes = {}
             try:
                 inventory_ttl = int(record.get("ttl", 4))
             except (TypeError, ValueError):
@@ -953,6 +1102,7 @@ class Chat:
                     if (type(low) is int and type(high) is int and
                             1 <= low <= high <= 0xFFFFFFFF):
                         origins.append((item[0], low, high))
+                        signature_indexes[item[0]] = index
             else:
                 origin = record.get("o", "")
                 if not isinstance(origin, str) or not NODE_ID.fullmatch(origin):
@@ -962,11 +1112,18 @@ class Chat:
                 if not 1 <= low <= high <= 0xFFFFFFFF:
                     return
                 origins = [(origin, low, high)]
-            for origin, low, high in origins:
+            for index, (origin, low, high) in enumerate(origins):
+                signature_mask = record.get("sig")
+                if (inventory_ttl == 4 and type(signature_mask) is int and
+                        signature_mask >= 0):
+                    self.peer_proofs[(peer, origin)] = bool(
+                        signature_mask & (1 << signature_indexes.get(origin, index)))
+                    while len(self.peer_proofs) > MAX_ANNOUNCED_ORIGINS:
+                        self.peer_proofs.pop(next(iter(self.peer_proofs)))
                 self._handle_inventory_entry(peer, origin, low, high,
                                              ttl=inventory_ttl)
-            record.setdefault("ttl", 4)
-            self._relay_record(record, ("i", peer, tuple(origins)))
+            # A cache announces its own inventory after storing new data.
+            # Flooded copies cannot serve a one-hop broadcast history page.
         elif kind == "q":
             requester = record.get("from", "")
             origin = record.get("o", "")
@@ -1035,6 +1192,7 @@ class Chat:
                     origin, after, through,
                     limit=20 if proof_page else SYNC_PAGE_MESSAGES,
                     since=since)
+            response_priority = 10
             for row in rows:
                 if not record.get("v") and not record.get("j"):
                     # History pages are public gossip: every listener can
@@ -1043,13 +1201,16 @@ class Chat:
                     # overhearers do not echo the just-heard fragments.
                     frames = message_parts(origin=row["o"], seq=row["s"], channel=row["c"],
                                            nick=row["n"], timestamp=row["ts"], text=row["b"])
+                    if (len(rows) == 1 and len(frames) == 1 and
+                            0 <= now_epoch - int(row["ts"]) <= LIVE_MESSAGE_REPAIR_SECONDS):
+                        response_priority = 0
                     mask = fragment_masks.get(int(row["s"]))
                     selected = ([(index, frame) for index, frame in enumerate(frames)
                                  if mask == 0 or mask & (1 << index)]
                                 if mask is not None else list(enumerate(frames)))
                     for _, frame in selected:
                         try:
-                            self.data.send(frame, priority=10)
+                            self.data.send(frame, priority=response_priority)
                         except (OSError, queue.Full, ConnectionError):
                             break
                 # Attachment metadata is tiny and broadcast so every cache
@@ -1084,13 +1245,14 @@ class Chat:
                           "g": (repair_sequences if repair_sequences else
                                 [] if proof_page else [int(row["s"]) for row in rows]),
                           "j": bool(repair_sequences),
-                          "v": proof_page, "k": request_attempt, "ttl": 4}
+                          "v": proof_page, "k": request_attempt,
+                          "ttl": 0 if int(record.get("ttl", 4)) == 0 else 4}
             self._send_routed_record(end_record,
                                      ("e", self.store.node, requester, origin, after,
                                       end_record["b"], end_record["f"], proof_page,
                                       tuple(end_record["g"]), end_record["j"],
                                       request_attempt),
-                                     priority=10)
+                                     priority=response_priority)
         elif kind == "e":
             page_attempt = record.get("k", 0)
             if type(page_attempt) is not int or not 0 <= page_attempt <= 31:
@@ -1165,7 +1327,7 @@ class Chat:
                             "x": bool(record.get("x")), "r": missing,
                             "h": [[seq, self.store.missing_fragment_mask(origin, seq)]
                                   for seq in missing],
-                            "ttl": 4,
+                            "ttl": 0,
                         }
                         repair_route = ("q", self.store.node, peer, origin,
                                         after, last_returned, False,
@@ -1227,7 +1389,7 @@ class Chat:
                                       "b": next_through, "d": since,
                                       "f": window_start,
                                       "u": int(record.get("u", through)),
-                                      "ttl": 4}
+                                      "ttl": 0}
                     self._send_sync_request(
                         request_record, key,
                         ("q", self.store.node, peer, origin, next_after,
@@ -1240,26 +1402,25 @@ class Chat:
                 route_key = ("w", requester, record.get("v", 1))
                 if self._route_once(route_key, max(ttl, 1)):
                     self.announce(legacy=record.get("v") != 2)
-                    if ttl > 0:
-                        forwarded = dict(record)
-                        forwarded["ttl"] = ttl - 1
-                        self.send_record(forwarded)
         elif kind == "r":
             origin, seq = record.get("o", ""), int(record.get("s", 0))
             recipient_id = record.get("p") or record.get("from", "")
             recipient = str(record.get("n", ""))
             mention = str(record.get("m", ""))
             received_at = int(record.get("at", time.time()))
-            if not self.store.add_relay_receipt(origin, seq, recipient_id, recipient,
-                                                mention, received_at):
+            inserted = self.store.add_relay_receipt(origin, seq, recipient_id, recipient,
+                                                    mention, received_at)
+            if not inserted and not self.store.has_relay_receipt(
+                    origin, seq, recipient_id, mention):
                 return
             if origin == self.store.node:
-                if self.store.mark_receipt(origin, seq, recipient, mention, received_at):
+                if inserted and self.store.mark_receipt(origin, seq, recipient,
+                                                        mention, received_at):
                     self.events.put(("receipt", {"s": seq, "n": recipient, "m": mention}))
                 self.store.mark_relay_receipt_delivered(origin, seq, recipient_id, mention)
-                now = time.monotonic()
-                ack_key = (origin, seq, recipient_id, mention)
-                self._remember_receipt_ack(ack_key, now)
+                # Receipts are retried until their acknowledgement arrives.
+                # Re-send the ACK for a duplicate receipt so one lost ACK does
+                # not leave the sender waiting forever.
                 self.send_record({"t": "ra", "o": origin, "s": seq,
                                   "p": recipient_id, "m": mention, "ttl": 16})
             else:
@@ -1281,7 +1442,8 @@ class Chat:
                     self.send_record(record)
 
     def _handle_inventory_entry(self, peer: str, origin: str, low: int,
-                                high: int, *, ttl: int = 4) -> None:
+                                high: int, *, ttl: int = 4,
+                                probe_proofs: bool = True) -> None:
         # A forwarded inventory is useful gossip, but its owner may be outside
         # radio range. Ask a station that directly announced a cached copy so
         # the broadcast page can reach this node in one hop.
@@ -1304,15 +1466,18 @@ class Chat:
                 key: state for key, state in self.pending_sync_windows.items()
                 if state[1] > now
             }
-            if already_synced or window_key in self.pending_sync_windows:
-                return
+            active_window = window_key in self.pending_sync_windows
+        if already_synced or active_window:
+            if already_synced and probe_proofs:
+                self._request_recent_proofs(peer, origin, low, high)
+            return
         if high > after:
             through = high
             request = (peer, origin, after)
             request_record = {"t": "q", "to": peer, "from": self.store.node,
                               "o": origin, "a": after, "b": through,
                               "d": since, "f": window_start, "u": through,
-                              "ttl": 4}
+                              "ttl": 0}
             with self.pending_lock:
                 # Only one neighbor should serve a given origin window. This
                 # prevents a relay and the origin from both sending the same
@@ -1331,7 +1496,7 @@ class Chat:
             # Tell the mesh this station can serve history the advertising
             # peer lacks; do not wait for the next periodic inventory round.
             self._queue_relay_announcement(origin)
-        elif local_recent:
+        elif local_recent and probe_proofs:
             # Message history may already match while lossy radio dropped
             # detached ARAP proof frames. Repair a bounded recent proof page.
             self._request_recent_proofs(peer, origin, low, high)
@@ -1461,6 +1626,12 @@ class Chat:
         self._request_proof_page(peer, origin, after, through)
 
     def _request_proof_page(self, peer: str, origin: str, after: int, through: int) -> None:
+        if self.peer_proofs.get((peer, origin)) is False:
+            return
+        rows = self.store.messages_between(origin, after, through, limit=20,
+                                          since=int(time.time()) - SYNC_HISTORY_SECONDS)
+        if rows and all(self.store.proof_for(origin, int(row["s"])) for row in rows):
+            return
         key = (peer, origin, after)
         now = time.monotonic()
         with self.pending_lock:
@@ -1473,7 +1644,7 @@ class Chat:
         request_record = {"t": "q", "to": peer, "from": self.store.node,
                           "o": origin, "a": after, "b": through,
                           "d": int(time.time()) - SYNC_HISTORY_SECONDS,
-                          "v": 1, "ttl": 4}
+                          "v": 1, "ttl": 0}
         sent = self._send_routed_record(
             request_record, ("q", self.store.node, peer, origin, after, through, True, ()))
         if not sent:
@@ -1516,21 +1687,70 @@ class Chat:
             for frame in image_parts(recipient=recipient, origin=origin, seq=seq,
                                      digest=digest, data=body,
                                      request_id=request_id, indexes=indexes):
+                record = unpack(frame)
+                key = (request_id, recipient, origin, seq, digest, int(record["i"]))
+                with self.image_lock:
+                    # Hearing a downstream relay must not make the sender
+                    # transmit its own chunk back into the same transfer.
+                    self.seen_image_chunks[key] = (int(record["ttl"]), time.monotonic() + 600)
+                    self._bound_timed_map(self.seen_image_chunks, time.monotonic(),
+                                          MAX_IMAGE_CHUNKS_SEEN)
                 self.data.send(frame, priority=10)
         except (OSError, ValueError, queue.Full, ConnectionError) as exc:
             self.events.put(("status", f"Could not queue image: {exc}"))
 
-    def _request_thumbnail(self, attachment: dict, *, attempt: int) -> int:
-        """Queue one explicit request or a repair request for missing chunks."""
+    def _receive_image_part(self, record: dict) -> None:
+        origin, seq, digest = record["o"], int(record["s"]), record["h"]
+        key = (origin, seq, digest)
+        if self.store.image_for(digest) is not None:
+            return
+        body = self.store.add_image_fragment(record)
+        attachment = self.store.attachment_for(origin, seq)
+        if not attachment or attachment["digest"] != digest:
+            return
+        count = (int(attachment["size"]) + 138) // 139
+        missing = self.store.missing_image_indices(origin, seq, count) if body is None else []
+        if body is None and int(record["i"]) in missing:
+            return
+        identity = {"o": origin, "s": seq}
+        # All listeners cache and display overheard images. Only an existing
+        # explicit download may schedule the next window or a repair.
+        self.events.put(("image-progress", identity))
+        advance = False
+        with self.image_lock:
+            if body is not None:
+                self.pending_images.pop(key, None)
+                self.image_windows.pop(key, None)
+            elif key in self.pending_images:
+                window = self.image_windows.get(key, set())
+                if int(record["i"]) in window:
+                    window.discard(int(record["i"]))
+                    attempt, _, expires = self.pending_images[key]
+                    self.pending_images[key] = (attempt, time.monotonic() + IMAGE_RETRY_SECONDS,
+                                                expires)
+                    advance = not window
+        if body is not None:
+            self.events.put(("image", identity))
+        elif advance:
+            self._request_thumbnail(attachment, attempt=0, continuing=True)
+
+    def _receiving_image_window(self) -> bool:
+        with self.image_lock:
+            return any(self.image_windows.values())
+
+    def _request_thumbnail(self, attachment: dict, *, attempt: int,
+                           continuing: bool = False) -> int:
+        """Request one small window; received chunks acknowledge its progress."""
         origin, seq, digest = (attachment["origin"], int(attachment["seq"]),
                                attachment["digest"])
         count = (int(attachment["size"]) + 138) // 139
         missing = self.store.missing_image_indices(origin, seq, count)
-        if not missing:
-            missing = list(range(count))
-        groups = ([None] if missing == list(range(count)) else
-                  [missing[offset:offset + 3] for offset in range(0, len(missing), 3)])
-        queued = 0
+        if not missing or self.store.image_for(digest) is not None:
+            return 0
+        # Give new chat inventories a turn before asking the sender for the
+        # next burst. Polling while that burst arrives causes hidden-terminal
+        # collisions between the image source and its own requester.
+        self._flush_relay_announcements(image_boundary=True)
         now = time.monotonic()
         key = (origin, seq, digest)
         with self.image_lock:
@@ -1539,32 +1759,44 @@ class Chat:
                     len(self.pending_images) >= MAX_PENDING_IMAGES):
                 self.events.put(("status", "Too many thumbnail requests are already pending"))
                 return 0
-        for batch in groups:
-            request_id = secrets.token_hex(4)
-            request_key = (self.store.node, origin, seq, digest, request_id)
-            with self.image_lock:
-                self.seen_image_requests[request_key] = (4, now + 120)
-                self._bound_timed_map(self.seen_image_requests, now, MAX_IMAGE_REQUESTS)
-            record = {"t": "g", "p": self.store.node, "o": origin, "s": seq,
-                      "h": digest, "id": request_id, "ttl": 4}
-            if batch is not None:
-                record["i"] = batch
-            queued += bool(self.send_record(record))
-        with self.image_lock:
-            if queued:
-                self.pending_images[key] = (attempt, now + 45, now + 600)
-                while len(self.pending_images) > MAX_PENDING_IMAGES:
-                    oldest = min(self.pending_images,
-                                 key=lambda item: self.pending_images[item][2])
-                    self.pending_images.pop(oldest, None)
-            elif attempt == 0:
+            previous = self.pending_images.get(key)
+            if continuing and previous is None:
+                return 0
+            window = sorted(self.image_windows.get(key, set()).intersection(missing))
+            batch = window if attempt > 0 and window else missing[:IMAGE_REQUEST_WINDOW]
+            expires = previous[2] if previous and (continuing or attempt > 0) else now + 600
+            if expires <= now:
                 self.pending_images.pop(key, None)
-        if attempt == 0:
-            if queued == len(groups):
+                self.image_windows.pop(key, None)
+                return 0
+            self.pending_images[key] = (attempt, now + IMAGE_RESPONSE_SECONDS, expires)
+            self.image_windows[key] = set(batch)
+        request_id = secrets.token_hex(4)
+        request_key = (self.store.node, origin, seq, digest, request_id)
+        with self.image_lock:
+            self.seen_image_requests[request_key] = (4, now + 120)
+            self._bound_timed_map(self.seen_image_requests, now, MAX_IMAGE_REQUESTS)
+        record = {"t": "g", "p": self.store.node, "o": origin, "s": seq,
+                  "h": digest, "id": request_id, "ttl": 4, "i": batch}
+        # JSON requests with larger sequence/index numbers fit fewer entries.
+        # Keep each request inside the existing wire limit without flooding
+        # several repair batches into the channel at once.
+        while len(batch) > 1:
+            try:
+                pack(record)
+                break
+            except ValueError:
+                batch = batch[:-1]
+                record["i"] = batch
+        with self.image_lock:
+            self.image_windows[key] = set(batch)
+        queued = int(self.send_record(record))
+        if not queued:
+            with self.image_lock:
+                self.pending_images[key] = (attempt, now + 30, expires)
+        if attempt == 0 and not continuing:
+            if queued:
                 self.events.put(("status", "Image requested from nearby stations"))
-            elif queued:
-                self.events.put(("status", f"Queued {queued}/{len(groups)} image request batches; "
-                                 "missing chunks will be retried"))
             else:
                 self.events.put(("status", "Image request could not be queued; try again"))
         return queued
@@ -1577,6 +1809,7 @@ class Chat:
             for key, (_, _, expires) in list(self.pending_images.items()):
                 if expires <= now:
                     self.pending_images.pop(key, None)
+                    self.image_windows.pop(key, None)
         for (origin, seq, digest), (attempt, _, expires) in due:
             with self.image_lock:
                 current = self.pending_images.get((origin, seq, digest))
@@ -1584,6 +1817,7 @@ class Chat:
                     continue
                 if attempt >= 3 or expires <= now:
                     self.pending_images.pop((origin, seq, digest), None)
+                    self.image_windows.pop((origin, seq, digest), None)
                     self.events.put(("status", f"Thumbnail {origin[:8]}:{seq} still incomplete; "
                                     "select it to request again"))
                     continue
@@ -1591,6 +1825,7 @@ class Chat:
             if not attachment or attachment["digest"] != digest or self.store.image_for(digest):
                 with self.image_lock:
                     self.pending_images.pop((origin, seq, digest), None)
+                    self.image_windows.pop((origin, seq, digest), None)
                 continue
             queued = self._request_thumbnail(attachment, attempt=attempt + 1)
             if queued:
@@ -1911,6 +2146,8 @@ def main():
                         default=float(os.getenv("KISSCHAT_AX25_INTERFRAME_DELAY") or "0.25"),
                         help="extra seconds between estimated AX.25 frames (default 0.25)")
     parser.add_argument("--db", default=os.path.expanduser("~/.local/share/kisschat/chat.sqlite3"))
+    parser.add_argument("--debug-log", default="",
+                        help="append timestamped transport and protocol events to this file")
     parser.add_argument("--arap-cli", default=os.getenv("ARAP_CLI", "arap"),
                         help="ARAP executable used for message signatures")
     parser.add_argument("--arap-key", default=os.getenv("KISSCHAT_ARAP_KEY", ""),
@@ -1925,9 +2162,20 @@ def main():
                         help="environment variable read by ARAP for encrypted-key signing")
     parser.add_argument("--headless", action="store_true",
                         help="stay connected and relay/sync history without a terminal UI")
-    parser.add_argument("--auto-sync", action="store_true",
-                        help="periodically exchange history (broadcast mode transmits on air)")
+    parser.add_argument("--auto-sync", dest="auto_sync", action="store_true",
+                        help="periodically exchange history (the default; transmits on air)")
+    parser.add_argument("--no-auto-sync", dest="auto_sync", action="store_false",
+                        help="disable periodic history exchange")
+    parser.set_defaults(auto_sync=True)
     args = parser.parse_args()
+    if args.debug_log:
+        args.debug_log = os.path.abspath(os.path.expanduser(args.debug_log))
+        try:
+            os.makedirs(os.path.dirname(args.debug_log), exist_ok=True)
+            with open(args.debug_log, "a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            parser.error(f"cannot open debug log: {exc}")
     chat = Chat(args)
     try:
         signal.signal(signal.SIGTERM, _handle_sigterm)

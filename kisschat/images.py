@@ -10,6 +10,10 @@ from .protocol import MAX_THUMBNAIL_BYTES
 
 
 MAX_EDGE = 160
+# The inline renderer uses at most 40 columns by 18 terminal rows, with two
+# vertical pixels per row. Keep new radio images at twice that pixel size.
+SEND_MAX_WIDTH = 80
+SEND_MAX_HEIGHT = 72
 MAX_INPUT_BYTES = 20 * 1024 * 1024
 
 
@@ -24,7 +28,7 @@ def make_thumbnail(path: str) -> tuple[bytes, int, int]:
         if opened.width * opened.height > 40_000_000:
             raise ValueError("image dimensions exceed 40 megapixels")
         image = ImageOps.exif_transpose(opened)
-        image.thumbnail((MAX_EDGE, MAX_EDGE), Image.Resampling.LANCZOS)
+        image.thumbnail((SEND_MAX_WIDTH, SEND_MAX_HEIGHT), Image.Resampling.LANCZOS)
         if "A" in image.getbands() or "transparency" in image.info:
             rgba = image.convert("RGBA")
             flattened = Image.new("RGB", rgba.size, "white")
@@ -32,9 +36,9 @@ def make_thumbnail(path: str) -> tuple[bytes, int, int]:
             image = flattened
         else:
             image = image.convert("RGB")
-    for width, quality in ((160, 58), (128, 54), (96, 48), (64, 44)):
+    for width, quality in ((80, 58), (64, 54), (48, 48), (32, 44)):
         candidate = image.copy()
-        candidate.thumbnail((width, width), Image.Resampling.LANCZOS)
+        candidate.thumbnail((width, SEND_MAX_HEIGHT), Image.Resampling.LANCZOS)
         output = BytesIO()
         candidate.save(output, format="JPEG", quality=quality, optimize=True,
                        progressive=False)

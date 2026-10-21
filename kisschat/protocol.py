@@ -23,6 +23,24 @@ def _message_chunk_limit(channel_bytes: int, nick_bytes: int, *, relay: bool = F
 
 
 def pack(record: dict) -> bytes:
+    if record.get("t") == "k":
+        try:
+            sender = bytes.fromhex(record["from"])
+            entries = record.get("h", [])
+            if (len(sender) != 16 or not isinstance(entries, list) or
+                    len(entries) > 8 or
+                    any(not isinstance(item, list) or len(item) != 3 or
+                        not isinstance(item[0], str) or len(bytes.fromhex(item[0])) != 16 or
+                        any(type(value) is not int or not 0 <= value <= 0xFFFFFFFF
+                            for value in item[1:]) or item[1] > item[2]
+                        for item in entries)):
+                raise ValueError("invalid history summary")
+            return (MAGIC + b"K" + sender + bytes((len(entries),)) +
+                    b"".join(bytes.fromhex(origin) + low.to_bytes(4, "big") +
+                             high.to_bytes(4, "big")
+                             for origin, low, high in entries))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid history summary") from exc
     if record.get("t") == "q" and "h" in record:
         try:
             destination = bytes.fromhex(record["to"])
@@ -136,6 +154,21 @@ def unpack(wire: bytes) -> dict | None:
     if len(wire) > MAX_FRAME:
         return None
     if len(wire) < 4 or wire[3:4] != b"J":
+        if wire[3:4] == b"K":
+            if len(wire) < 21 or wire[20] > 8 or len(wire) != 21 + wire[20] * 24:
+                return None
+            sender = wire[4:20].hex()
+            entries = []
+            offset = 21
+            for _ in range(wire[20]):
+                origin = wire[offset:offset + 16].hex()
+                low = int.from_bytes(wire[offset + 16:offset + 20], "big")
+                high = int.from_bytes(wire[offset + 20:offset + 24], "big")
+                if not low or low > high:
+                    return None
+                entries.append([origin, low, high])
+                offset += 24
+            return {"t": "k", "from": sender, "h": entries}
         if wire[3:4] == b"H":
             if len(wire) < 75:
                 return None

@@ -7,6 +7,7 @@ This never opens a modem socket. Use commands such as ``send A hello`` and
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from io import BytesIO
 from collections import deque
 from dataclasses import dataclass, field
@@ -54,7 +55,8 @@ class Mesh:
                  drop_first_history_page_end: bool,
                  drop_first_image_fragment: bool,
                  drop_first_proof_fragment: bool,
-                 delay_first_history_page_end: float = 0.0):
+                 delay_first_history_page_end: float = 0.0,
+                 debug_log: str | None = None):
         self.loss = loss
         self.loss_model = loss_model
         self.burst_recovery = burst_recovery
@@ -69,6 +71,7 @@ class Mesh:
         self.time_scale = time_scale
         self.transport = transport
         self.trace_sync = trace_sync
+        self.debug_log = debug_log
         self.drop_first_history_fragment = drop_first_history_fragment
         self.drop_first_history_page_end = drop_first_history_page_end
         self.delay_first_history_page_end = delay_first_history_page_end
@@ -86,6 +89,8 @@ class Mesh:
         self.image_drop_match: tuple[str, str, int] | None = None
         self.dropped_image_index: int | None = None
         self.repaired_image_indexes: list[int] = []
+        self.image_received_indexes: dict[tuple, set[int]] = {}
+        self.image_requested_cached_indexes: list[int] = []
         self.proof_drop_armed = False
         self.proof_test_active = False
         self.proof_drop_match: tuple[str, str, int] | None = None
@@ -146,8 +151,17 @@ class Mesh:
         self.print_lock = threading.Lock()
 
     def log(self, message: str) -> None:
+        message = f"{datetime.now(timezone.utc).isoformat(timespec='milliseconds')} {message}"
         with self.print_lock:
             print(message, flush=True)
+            if self.debug_log:
+                try:
+                    with open(self.debug_log, "a", encoding="utf-8") as stream:
+                        stream.write(message + "\n")
+                        stream.flush()
+                except OSError as exc:
+                    print(f"[mesh] cannot write debug log {self.debug_log}: {exc}",
+                          flush=True)
 
     def attach(self, radio: "SimRadio") -> None:
         self.nodes[radio.name] = radio
@@ -234,12 +248,19 @@ class Mesh:
                 record.get("o") == self.history_drop_match[1]):
             with self.lock:
                 self.history_data_after_manifest_retry += 1
+        image_key = (station, record.get("o"), record.get("s"), record.get("h"))
+        if direction == "RX" and kind == "x":
+            with self.lock:
+                self.image_received_indexes.setdefault(image_key, set()).add(int(record["i"]))
         if (direction == "TX" and station == "C" and kind == "g" and
-                isinstance(record.get("i"), list)):
+                isinstance(record.get("i"), list) and self.dropped_image_fragment):
             with self.lock:
                 self.stats[station]["image_repair_requests"] += 1
                 self.repaired_image_indexes.extend(
                     index for index in record["i"] if type(index) is int)
+                received = self.image_received_indexes.get(image_key, set())
+                self.image_requested_cached_indexes.extend(
+                    index for index in record["i"] if index in received)
         if direction == "TX" and kind == "p":
             with self.lock:
                 self.stats[station]["proof_fragments"] += 1
@@ -415,6 +436,7 @@ class Mesh:
                 with self.lock:
                     self.stats[radio.name]["collisions"] += 1
                     self.stats[radio.name]["lost"] += 1
+                self.log(f"[air] {radio.name} -> {name} collision; frame lost")
                 continue
             dropped, burst_drop = self._drop_for_loss(radio.name, name)
             if dropped:
@@ -422,6 +444,7 @@ class Mesh:
                     self.stats[radio.name]["lost"] += 1
                     if burst_drop:
                         self.stats[radio.name]["burst_losses"] += 1
+                self.log(f"[air] {radio.name} -> {name} {'burst ' if burst_drop else ''}loss")
                 continue
             visible_records = tuple(record for index, record in enumerate(records)
                                     if index not in drop_indices and
@@ -429,7 +452,9 @@ class Mesh:
             if not visible_records:
                 with self.lock:
                     self.stats[radio.name]["lost"] += 1
+                self.log(f"[air] {radio.name} -> {name} all records suppressed")
                 continue
+            self.log(f"[air] {radio.name} -> {name} delivered {len(visible_records)} record(s)")
             delayed_records: list[bytes] = []
             if (radio.name == "B" and name == "C" and
                     self.delay_first_history_page_end > 0 and
@@ -673,6 +698,8 @@ def main() -> None:
                         help="maximum random channel-access backoff in seconds (default 0.5)")
     parser.add_argument("--batch-window", type=float, default=0.08,
                         help="seconds to collect queued records for a compressed frame")
+    parser.add_argument("--image-pattern", choices=("solid", "noise"), default="solid",
+                        help="thumbnail fixture content; noise exercises transfers with many chunks")
     parser.add_argument("--time-scale", type=float, default=1.0,
                         help="wall-time scale; 0.1 runs the radio model 10x faster")
     parser.add_argument("--seed", type=int, default=7,
@@ -689,6 +716,8 @@ def main() -> None:
                         help="write machine-readable scenario results and station histories")
     parser.add_argument("--trace-sync", action="store_true",
                         help="log inventory, page-request, and page-end records")
+    parser.add_argument("--auto-sync", action="store_true",
+                        help="enable the same periodic history exchange as live clients")
     parser.add_argument("--drop-first-history-fragment", action="store_true",
                         help="drop one B-sent A-origin history fragment during sync C A")
     parser.add_argument("--drop-first-history-page-end", action="store_true",
@@ -729,6 +758,7 @@ def main() -> None:
         for name, nick in zip(STATIONS, ("Alice", "Bob", "Casey")):
             chat = Chat(make_args(name, nick, os.path.join(temp.name, name + ".sqlite3"),
                                   opts.transport, opts.sync_retry_seconds))
+            chat.auto_sync = opts.auto_sync
             radio = SimRadio(name, chat.store.node, mesh, opts.batch_window)
             radio.on_frame = chat._on_frame
             chat.data = radio
@@ -774,8 +804,12 @@ def main() -> None:
         partition_baselines: dict[tuple[str, str], dict[str, int]] = {}
         partitioned_links: set[tuple[str, str]] = set()
         image_payload = BytesIO()
-        Image.new("RGB", (160, 120), (54, 122, 156)).save(
-            image_payload, format="JPEG", quality=70, optimize=True)
+        fixture_image = (Image.frombytes("RGB", (160, 120),
+                                        random.Random(opts.seed).randbytes(160 * 120 * 3))
+                         if opts.image_pattern == "noise" else
+                         Image.new("RGB", (160, 120), (54, 122, 156)))
+        fixture_image.save(image_payload, format="JPEG",
+                           quality=35 if opts.image_pattern == "noise" else 70, optimize=True)
         image_bytes = image_payload.getvalue()
         published_image: dict[str, object] = {}
         sent_messages: dict[str, tuple[str, int]] = {}
@@ -1107,6 +1141,19 @@ def main() -> None:
                             station, attachment["origin"], int(attachment["seq"]))
                         mesh.image_drop_armed = True
                 return True
+            if command == "wait-image":
+                station, _, timeout = rest.partition(" ")
+                station = station.upper()
+                deadline = time.monotonic() + min(600, max(0, float(timeout or "180")))
+                digest = str(published_image.get("digest", ""))
+                while station in chats and time.monotonic() < deadline:
+                    if chats[station].store.image_for(digest) is not None:
+                        break
+                    time.sleep(0.1)
+                if station not in chats or chats[station].store.image_for(digest) is None:
+                    mesh.log(f"IMAGE WAIT FAIL: {station} did not finish before its deadline")
+                    verification_failed = True
+                return True
             if command == "retry-image":
                 station = rest.strip().upper()
                 if station not in chats:
@@ -1171,17 +1218,19 @@ def main() -> None:
                 received = chats[station].store.image_for(digest) if station in chats else None
                 if received == image_bytes and chats[station].store.attachment_for(origin, seq):
                     if mesh.drop_first_image_fragment:
+                        repair_station = mesh.image_drop_match[0] if mesh.image_drop_match else station
                         repaired = (mesh.dropped_image_fragment and
                                     mesh.dropped_image_index is not None and
-                                    mesh.stats[station]["image_repair_requests"] > 0 and
-                                    mesh.repaired_image_indexes == [mesh.dropped_image_index])
+                                    mesh.stats[repair_station]["image_repair_requests"] > 0 and
+                                    mesh.dropped_image_index in mesh.repaired_image_indexes and
+                                    not mesh.image_requested_cached_indexes)
                         if not repaired:
                             verification_failed = True
-                            mesh.log("IMAGE FAIL: thumbnail completed without the expected "
-                                     "single missing-chunk request")
+                            mesh.log("IMAGE FAIL: repair did not request the dropped chunk, "
+                                     "or requested chunks already received")
                             return True
-                        mesh.log("IMAGE REPAIR PASS: one dropped chunk was requested selectively "
-                                 "and the thumbnail digest verified")
+                        mesh.log("IMAGE REPAIR PASS: missing chunks were requested selectively "
+                                 "without requesting cached chunks; thumbnail digest verified")
                     else:
                         mesh.log("IMAGE PASS: requested thumbnail received and verified by digest")
                 else:
@@ -1363,6 +1412,7 @@ def main() -> None:
                 chat = Chat(make_args(station, station_nicks[station],
                                       station_db_paths[station], opts.transport,
                                       opts.sync_retry_seconds))
+                chat.auto_sync = opts.auto_sync
                 radio = SimRadio(station, chat.store.node, mesh, opts.batch_window)
                 radio.on_frame = chat._on_frame
                 chat.data = radio

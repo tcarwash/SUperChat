@@ -1,0 +1,13 @@
+# Run with --image-pattern noise --topology line --loss 0 --time-scale 0.05
+# Only C requests the image. B must cache the complete overheard image too.
+send-image A Windowed thumbnail test
+wait 10
+sync C A
+wait 5
+verify-image-metadata C A
+request-image C A
+wait-image C 180
+verify-image-received C
+verify-image-received B
+verify
+quit

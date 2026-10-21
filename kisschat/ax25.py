@@ -49,9 +49,27 @@ def decode_ui_frame(frame: bytes) -> bytes | None:
         addresses += 1
         if extension:
             break
-    if len(frame) < offset + 2 or frame[offset:offset + 2] != b"\x03\xf0":
+    if addresses < 2 or len(frame) < offset + 2 or frame[offset:offset + 2] != b"\x03\xf0":
         return None
     return frame[offset + 2:]
+
+
+def ui_reception(frame: bytes) -> dict:
+    """Source address and actual digipeater use from a validated UI frame."""
+    source = frame[7:14]
+    call = ''.join(chr(byte >> 1) for byte in source[:6]).rstrip()
+    ssid = (source[6] >> 1) & 15
+    repeated = False
+    offset = 14
+    if not source[6] & 1:
+        while offset + 7 <= len(frame):
+            flags = frame[offset + 6]
+            repeated |= bool(flags & 0x80)
+            offset += 7
+            if flags & 1:
+                break
+    return {"source": f"{call}-{ssid}" if ssid else call,
+            "repeated": repeated}
 
 
 def pack_batch(payloads: tuple[bytes, ...] | list[bytes], *,

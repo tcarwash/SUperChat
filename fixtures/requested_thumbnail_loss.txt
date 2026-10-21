@@ -10,5 +10,6 @@ wait 20
 retry-image C
 wait 15
 verify-image-received C
+verify-image-received B
 verify
 quit

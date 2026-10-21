@@ -1,0 +1,13 @@
+# Requires --auto-sync; recover all messages without manual /sync commands.
+send A West station here.
+wait 2
+send B Relay station here.
+wait 2
+send C East station here.
+wait 90
+history A
+history B
+history C
+verify
+stats
+quit

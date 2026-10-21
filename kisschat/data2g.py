@@ -7,7 +7,8 @@ import socket
 import threading
 import time
 from .ax25 import (decode_ui_frame, encode_ui_frame, pack_batch,
-                   unpack_batch)
+                   unpack_batch, ui_reception)
+from .protocol import unpack
 
 FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 KISS_DATA, KISS_ACKMODE = 0x00, 0x0C
@@ -71,7 +72,7 @@ class Data2G:
                  ax25_destination: str = "CQ", digipeaters: tuple[str, ...] = (),
                  kiss_tnc_port: int = 0,
                  ax25_baud: int = 1200, ax25_interframe_delay: float = 0.25,
-                 on_frame=None, on_status=None):
+                 on_frame=None, on_status=None, on_debug=None, on_frame_context=None):
         self.host, self.callsign = host, callsign.upper()
         if transport not in {"broadcast", "connected", "ax25"}:
             raise ValueError("transport must be broadcast, connected, or ax25")
@@ -96,6 +97,8 @@ class Data2G:
         self.ax25_interframe_delay = float(ax25_interframe_delay)
         self.bandwidth = bandwidth
         self.on_frame, self.on_status = on_frame, on_status
+        self.on_frame_context = on_frame_context
+        self.on_debug = on_debug
         self.command_socket = self.kiss_socket = self.data_socket = None
         self.port = None
         self.outbound: queue.Queue[bytes | None] = queue.Queue(maxsize=128)
@@ -111,6 +114,35 @@ class Data2G:
         self.ack_condition = threading.Condition()
         self.pending_acks: dict[bytes, float] = {}
         self.ack_order: deque[bytes] = deque()
+        self.tx_state_lock = threading.Lock()
+        self.tx_state = "idle"
+        self.tx_state_since = time.monotonic()
+        self.tx_last_submit = 0.0
+
+    def transmit_snapshot(self) -> dict:
+        """Return a small, UI-safe snapshot of the transmit pipeline."""
+        with self.tx_state_lock:
+            state = self.tx_state
+            age = max(0, int(time.monotonic() - self.tx_state_since))
+            last_submit = self.tx_last_submit
+        with self.ack_condition:
+            pending_acks = len(self.pending_acks)
+            oldest_ack = max((time.monotonic() - sent_at
+                              for sent_at in self.pending_acks.values()), default=0)
+        return {
+            "queued": self.outbound.qsize() + self.bulk_outbound.qsize(),
+            "state": state,
+            "age": age,
+            "pending_acks": pending_acks,
+            "oldest_ack": int(oldest_ack),
+            "last_submit": last_submit,
+            "transport": self.transport,
+        }
+
+    def _set_tx_state(self, state: str) -> None:
+        with self.tx_state_lock:
+            self.tx_state = state
+            self.tx_state_since = time.monotonic()
 
     @staticmethod
     def _line(sock: socket.socket, timeout: float = 5) -> str:
@@ -270,6 +302,12 @@ class Data2G:
             # The KISS reader also processes ACKMODE replies. Blocking here
             # could prevent it from freeing the in-flight window.
             self.outbound.put_nowait(payload)
+        self._debug_frames("TX_QUEUE", (payload,))
+
+    def _debug_frames(self, event: str, records) -> None:
+        if self.on_debug:
+            self.on_debug(event, {"records": [unpack(record) for record in records],
+                                  "queued": self.outbound.qsize() + self.bulk_outbound.qsize()})
 
     def discard_queued_transmissions(self) -> int:
         """Drop frames not yet picked up by a transport writer."""
@@ -320,13 +358,15 @@ class Data2G:
                 if not chunk:
                     break
                 for port, command, payload in parser.feed(chunk):
-                    if command == KISS_DATA and self.on_frame:
+                    if command == KISS_DATA and (self.on_frame or self.on_frame_context):
+                        reception = {}
                         if self.transport == "ax25":
                             if port != self.kiss_tnc_port:
                                 continue
                             info = decode_ui_frame(payload)
                             if info is None:
                                 continue
+                            reception = ui_reception(payload)
                             records = unpack_batch(info) or (info,)
                             port = self.port
                         elif self.transport == "broadcast":
@@ -335,7 +375,10 @@ class Data2G:
                             records = (payload,)
                         for record in records:
                             try:
-                                self.on_frame(port, record)
+                                if self.on_frame_context:
+                                    self.on_frame_context(port, record, reception)
+                                else:
+                                    self.on_frame(port, record)
                             except Exception as exc:
                                 self._status(f"Ignored invalid KISSChat frame: {exc}")
                     elif command == KISS_ACKMODE and self.transport == "broadcast":
@@ -463,8 +506,14 @@ class Data2G:
                 self._status("ARQ record exceeds Data2G's 255-byte stream limit")
                 continue
             try:
+                self._set_tx_state("writing to Data2G")
                 self.data_socket.sendall(bytes((len(payload),)) + payload)
+                self._debug_frames("TX_SUBMIT", records)
+                with self.tx_state_lock:
+                    self.tx_last_submit = time.monotonic()
+                self._set_tx_state("idle")
             except OSError as exc:
+                self._set_tx_state("write failed")
                 self._status(f"ARQ transmit error: {exc}")
                 self.stop_event.set()
                 return
@@ -492,6 +541,7 @@ class Data2G:
                             continue
             if item is None:
                 return
+            records = [item]
             try:
                 if self.transport in {"ax25", "broadcast"}:
                     if self.transport == "ax25":
@@ -502,6 +552,7 @@ class Data2G:
                         # Keep interactive traffic out of the modem's transmit
                         # FIFO until the previous normal frame has aired. Any
                         # messages queued meanwhile can then share one frame.
+                        self._set_tx_state("waiting for host receipt")
                         self._wait_for_kiss_ack(last_normal_tag)
                         last_normal_tag = None
                         if self.stop_event.is_set():
@@ -529,8 +580,12 @@ class Data2G:
                     if self.transport == "ax25":
                         frame = encode_ui_frame(self.callsign, self.ax25_destination,
                                                 self.digipeaters, info)
+                        self._set_tx_state("writing to KISS")
                         self.kiss_socket.sendall(
                             encode_kiss(self.kiss_tnc_port, KISS_DATA, frame))
+                        with self.tx_state_lock:
+                            self.tx_last_submit = time.monotonic()
+                        self._set_tx_state("idle")
                         # KISS has no transmit-complete notification. Pace subsequent
                         # submissions by estimated airtime so the TNC queue cannot
                         # turn a history sync into an unbounded on-air burst.
@@ -539,19 +594,31 @@ class Data2G:
                         next_ax25_tx = (time.monotonic() + estimated_airtime +
                                         self.ax25_interframe_delay)
                     else:
+                        self._set_tx_state("waiting for ACKMODE slot")
                         tag = self._reserve_kiss_tag()
                         if tag is None:
                             return
+                        self._set_tx_state("writing to KISS")
                         self.kiss_socket.sendall(
                             encode_kiss(self.port, KISS_ACKMODE, tag + info))
+                        with self.tx_state_lock:
+                            self.tx_last_submit = time.monotonic()
+                        self._set_tx_state("idle")
                         if not from_bulk:
                             last_normal_tag = tag
                 else:
+                    self._set_tx_state("waiting for ACKMODE slot")
                     tag = self._reserve_kiss_tag()
                     if tag is None:
                         return
+                    self._set_tx_state("writing to KISS")
                     self.kiss_socket.sendall(encode_kiss(self.port, KISS_ACKMODE, tag + item))
+                    with self.tx_state_lock:
+                        self.tx_last_submit = time.monotonic()
+                    self._set_tx_state("idle")
+                self._debug_frames("TX_SUBMIT", records)
             except OSError as exc:
+                self._set_tx_state("write failed")
                 if self.transport != "ax25":
                     self._forget_kiss_tag(tag)
                 self._status(f"KISS transmit error: {exc}")
