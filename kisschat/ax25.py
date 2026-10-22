@@ -6,7 +6,7 @@ import zlib
 
 _ADDRESS = re.compile(r"^([A-Z0-9]{1,6})(?:-([0-9]{1,2}))?$")
 MAX_INFORMATION_BYTES = 256
-_BATCH_MAGIC = b"KC1B"
+_BATCH_MAGIC = b"KC2B"
 
 
 def _address(value: str, *, last: bool, repeated: bool = False) -> bytes:
@@ -83,7 +83,7 @@ def pack_batch(payloads: tuple[bytes, ...] | list[bytes], *,
         return None
     raw = bytearray()
     for payload in payloads:
-        if not payload.startswith(b"KC1") or len(payload) > 255:
+        if not payload.startswith(b"KC2") or len(payload) > 255:
             return None
         raw.append(len(payload))
         raw.extend(payload)
@@ -130,7 +130,7 @@ def unpack_batch(info: bytes) -> tuple[bytes, ...] | None:
         if length == 0 or offset + length > len(raw):
             return None
         record = raw[offset:offset + length]
-        if not record.startswith(b"KC1") or record.startswith(_BATCH_MAGIC):
+        if not record.startswith(b"KC2") or record.startswith(_BATCH_MAGIC):
             return None
         records.append(record)
         offset += length

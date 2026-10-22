@@ -27,10 +27,16 @@ receive mode without an initial inventory burst. It periodically exchanges
 history by default, which lets clients recover messages lost when stations
 transmit at the same time. Use `/sync` to retry incomplete exchanges now or
 `--no-auto-sync` to disable periodic radio traffic.
-Headless relay mode enables
-periodic sync automatically, with a randomized 0–30 second delay added to each
-45 second interval so relays started together are less likely to transmit in
-lockstep. Routine inventories and history requests stay between directly heard
+Headless relay mode enables periodic sync automatically. The first routine
+sync and later syncs run after five minutes plus up to two minutes of jitter at
+any bandwidth. Use `/sync` to request an immediate exchange.
+Unanswered history requests on broadcast modes at or below 500 Hz retry from a
+60-second base interval with bounded exponential backoff; wider modes retain
+the 12-second retry base. These delays reduce control traffic on narrow modes;
+they can make history repair take longer. At 500 Hz and below, each inventory
+announcement is limited to 16 frames, relayed inventory announcements are
+spaced at least 30 seconds apart, missing image chunks retry after two minutes,
+and no more than four ACKMODE frames stay in flight. Routine inventories and history requests stay between directly heard
 neighbors. Each cache re-announces history it stores, so messages cross several
 hops without flooding every inventory or query back through the mesh.
 History page fragments are public broadcasts: listeners store complete
@@ -341,6 +347,12 @@ that can reach TCP ports 8300 and 8100 on the host for broadcast mode:
 python -m kisschat --host 192.0.2.10 --callsign N0CALL
 ```
 
+To limit broadcast transmissions, use `--max-bandwidth 500` (or another
+maximum in Hz). SUperChat chooses the widest mode advertised by that Data2G
+host within the limit. This setting applies to broadcast mode; `--bandwidth`
+controls connected ARQ, while `--mode` explicitly selects a broadcast mode and
+must fit under any configured maximum.
+
 For VARA-compatible connected mode, also allow the data port (default 8301):
 
 ```sh
@@ -373,6 +385,11 @@ When several records are queued, SUperChat compresses and bundles them into one
 radio frame when they fit. AX.25 bundles stay within the 256-byte information
 field limit; Data2G broadcast bundles stay within SUperChat's 220-byte record
 limit; connected ARQ bundles stay within its 255-byte stream-record limit.
+Application records use the KC2 wire format: compact typed fields, variable
+length integers, and binary station IDs replace JSON for control records.
+Specialized message, image, proof, and sync records keep their compact layouts.
+KC2 stations cannot exchange application records with KC1 stations, so update
+all stations in a mesh together.
 Broadcast interactive traffic waits for its preceding ACKMODE receipt before
 the next frame is submitted, so messages typed while one is on air can be
 bundled together. Long records that do not fit remain separate. Receiving
@@ -402,6 +419,7 @@ Useful options:
 --nick NAME             display name (defaults to callsign)
 --channel #NAME         initial channel (last selected, or #general on first run)
 --mode MODE             optional Data2G broadcast transmit mode
+--max-bandwidth HZ      broadcast mode maximum; choose widest advertised mode within it
 --unattended            use a Data2G mode at or below 500 Hz for automatic traffic; explicit sends may use --mode or the widest host mode
 --transport TRANSPORT   broadcast (default), connected, or ax25
 --bandwidth HZ          connected ARQ cap: 500, 1200, 2300, or 2750

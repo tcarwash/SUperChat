@@ -69,6 +69,7 @@ class Data2G:
     def __init__(self, host: str, callsign: str, *, command_port: int = 8300,
                  kiss_port: int = 8100, mode: str = "", transport: str = "broadcast",
                  bandwidth: str = "2300",
+                 max_bandwidth: int | None = None,
                  ax25_destination: str = "CQ", digipeaters: tuple[str, ...] = (),
                  kiss_tnc_port: int = 0,
                  ax25_baud: int = 1200, ax25_interframe_delay: float = 0.25,
@@ -100,6 +101,9 @@ class Data2G:
         self.ax25_baud = ax25_baud
         self.ax25_interframe_delay = float(ax25_interframe_delay)
         self.bandwidth = bandwidth
+        if max_bandwidth is not None and (type(max_bandwidth) is not int or max_bandwidth <= 0):
+            raise ValueError("maximum broadcast bandwidth must be a positive number of Hz")
+        self.max_bandwidth = max_bandwidth
         self.on_frame, self.on_status = on_frame, on_status
         self.on_frame_context = on_frame_context
         self.on_debug = on_debug
@@ -120,6 +124,7 @@ class Data2G:
         self.mode_catalog: list[tuple[str, float]] = []
         self.unattended_available = False
         self.policy_requests: queue.Queue[tuple[bool, threading.Event, list[Exception]]] = queue.Queue()
+        self.config_requests: queue.Queue[tuple[str, object, threading.Event, list[Exception]]] = queue.Queue()
         self.threads: list[threading.Thread] = []
         self.supervisor: threading.Thread | None = None
         self.tag = 0
@@ -288,6 +293,67 @@ class Data2G:
             finally:
                 done.set()
 
+    def set_broadcast_mode(self, mode: str, timeout: float = 20.0) -> None:
+        self._queue_config("mode", mode, timeout)
+
+    def set_max_bandwidth(self, bandwidth: int | None, timeout: float = 20.0) -> None:
+        self._queue_config("bandwidth", bandwidth, timeout)
+
+    def _queue_config(self, kind: str, value: object, timeout: float) -> None:
+        if self.transport != "broadcast" or not self.connected_event.is_set():
+            raise ConnectionError("Data2G broadcast link is not connected")
+        done, errors = threading.Event(), []
+        self.config_requests.put((kind, value, done, errors))
+        if not done.wait(timeout):
+            raise TimeoutError("timed out changing broadcast configuration")
+        if errors:
+            raise RuntimeError(str(errors[0])) from errors[0]
+
+    def _apply_config_requests(self) -> None:
+        while True:
+            try:
+                kind, value, done, errors = self.config_requests.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                cap = value if kind == "bandwidth" else self.max_bandwidth
+                requested_mode = str(value) if kind == "mode" else ""
+                if cap is not None and (type(cap) is not int or cap <= 0):
+                    raise ValueError("maximum broadcast bandwidth must be a positive number of Hz")
+                candidate_modes = [m for m in self.mode_catalog
+                                  if cap is None or m[1] <= cap]
+                if requested_mode:
+                    candidate_modes = [m for m in candidate_modes if m[0] == requested_mode]
+                    if not candidate_modes:
+                        raise ValueError("selected mode exceeds the maximum or is not advertised")
+                if not candidate_modes:
+                    raise ValueError("Data2G advertises no mode within this bandwidth limit")
+                auto = [m for m in self.mode_catalog if m[1] <= 500 and
+                        (cap is None or m[1] <= cap)]
+                if self.unattended and not auto:
+                    raise ValueError("unattended mode requires an advertised mode at or below 500 Hz")
+                manual = candidate_modes[0] if requested_mode else max(candidate_modes, key=lambda m: m[1])
+                old_mode, old_auto, old_cap = self.manual_mode, self.auto_mode, self.max_bandwidth
+                if kind == "mode":
+                    self.manual_mode = manual[0]
+                else:
+                    self.max_bandwidth = cap
+                    self.manual_mode = manual[0]
+                    self.auto_mode = min(auto, key=lambda m: m[1])[0] if auto else ""
+                    self.unattended_available = bool(auto)
+                target = self.auto_mode if self.unattended else self.manual_mode
+                try:
+                    if target and target != self.current_broadcast_mode:
+                        self._set_live_broadcast_mode(target)
+                        self.current_broadcast_mode = target
+                except Exception:
+                    self.manual_mode, self.auto_mode, self.max_bandwidth = old_mode, old_auto, old_cap
+                    raise
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
     def start(self) -> None:
         """Start a reconnecting connection manager and return immediately."""
         if self.supervisor and self.supervisor.is_alive():
@@ -316,14 +382,21 @@ class Data2G:
                 if self.unattended:
                     raise RuntimeError("cannot read Data2G MODES catalog for unattended operation")
                 modes = []
+            if self.max_bandwidth is not None and not modes:
+                raise RuntimeError("Data2G host returned no mode catalog; cannot enforce maximum bandwidth")
             self.mode_catalog = modes
-            narrow = [mode for mode in modes if mode[1] <= 500]
+            narrow = [mode for mode in modes if mode[1] <= 500 and
+                      (self.max_bandwidth is None or mode[1] <= self.max_bandwidth)]
             self.unattended_available = bool(narrow)
             if self.unattended and not narrow:
                 raise RuntimeError("unattended mode requires a Data2G broadcast mode at or below 500 Hz")
             configured = self.mode
             if configured and modes and configured not in {mode[0] for mode in modes}:
                 raise RuntimeError(f"Data2G mode {configured!r} is not in the host MODES catalog")
+            if configured and self.max_bandwidth is not None and modes:
+                configured_width = next(width for name, width in modes if name == configured)
+                if configured_width > self.max_bandwidth:
+                    raise RuntimeError(f"Data2G mode {configured!r} exceeds the {self.max_bandwidth} Hz maximum")
             response = self._command(self.command_socket, f"BCAST OPEN CHAT FROM {call}", "BCAST PORT ")
             self.port = int(next(line.split()[2] for line in response if line.startswith("BCAST PORT ")))
             if modes:
@@ -338,8 +411,12 @@ class Data2G:
                 self.unattended_available = bool(self.auto_mode)
                 if self.unattended and not self.unattended_available:
                     raise RuntimeError("Data2G refused every broadcast mode at or below 500 Hz")
-                manual_candidates = ([next(mode for mode in modes if mode[0] == configured)]
-                                     if configured else sorted(modes, key=lambda mode: mode[1], reverse=True))
+                eligible_modes = [mode for mode in modes if self.max_bandwidth is None or
+                                  mode[1] <= self.max_bandwidth]
+                if configured:
+                    manual_candidates = [next(mode for mode in modes if mode[0] == configured)]
+                else:
+                    manual_candidates = sorted(eligible_modes, key=lambda mode: mode[1], reverse=True)
                 for candidate, _width in manual_candidates:
                     try:
                         self._command(self.command_socket,
@@ -356,6 +433,8 @@ class Data2G:
                     if self.unattended or configured:
                         if not self.manual_mode:
                             raise RuntimeError("Data2G refused every advertised operator-send mode")
+                    if self.max_bandwidth is not None and not self.manual_mode:
+                        raise RuntimeError(f"Data2G host advertises no usable mode at or below {self.max_bandwidth} Hz")
                 selected_mode = self.auto_mode if self.unattended else self.manual_mode
                 if selected_mode:
                     self._command(self.command_socket,
@@ -711,6 +790,7 @@ class Data2G:
         last_normal_tag: bytes | None = None
         while not self.stop_event.is_set():
             self._apply_policy_requests()
+            self._apply_config_requests()
             if pending_normal is not None:
                 item, pending_normal, from_bulk = pending_normal, None, False
             else:
@@ -834,6 +914,10 @@ class Data2G:
     def _reserve_kiss_tag(self) -> bytes | None:
         with self.ack_condition:
             while not self.stop_event.is_set():
+                selected = self.auto_mode if self.unattended else self.manual_mode
+                selected_width = next((width for name, width in self.mode_catalog
+                                       if name == selected), None)
+                window = min(KISS_ACK_WINDOW, 4) if selected_width is not None and selected_width <= 500 else KISS_ACK_WINDOW
                 now = time.monotonic()
                 expired = [tag for tag, sent_at in self.pending_acks.items()
                            if now - sent_at >= KISS_ACK_TIMEOUT]
@@ -846,7 +930,7 @@ class Data2G:
                 if expired:
                     self._status(f"{len(expired)} KISS ACKMODE receipt(s) timed out; "
                                  "on-air status is unknown")
-                if len(self.pending_acks) < KISS_ACK_WINDOW:
+                if len(self.pending_acks) < window:
                     for _ in range(0x10000):
                         self.tag = (self.tag + 1) & 0xFFFF
                         tag = self.tag.to_bytes(2, "big")

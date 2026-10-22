@@ -533,3 +533,24 @@ station challenge-response do not replace offline message verification.
 - `../arap/README.md`, `../arap/protocol/verify.go`, `../arap/identity/trust.go`
 - `../arap/cmd/arap/main.go`, `../arap/docs/IMPLEMENTATION-PLAN.md`
 - `../arap/docs/VALIDATION.md`, `../arap/spec/ARAP-profile-v1.cddl`
+# 2026-10-21 checkpoint: narrow-mode sync airtime
+
+- Implemented: all bandwidths use five-minute routine sync intervals with up
+  to two minutes of jitter. Data2G broadcast modes at or below 500 Hz also use
+  a 60-second base retry interval with bounded exponential backoff; wider modes
+  keep the 12-second retry base. At 500 Hz, inventory announcements are capped
+  at 16 frames, relayed inventories are spaced by 30 seconds, and image chunk
+  retries wait two minutes; ACKMODE has at most four frames in flight. README
+  documents the airtime/repair latency tradeoff.
+- Validation: code inspection and `git diff --check`; no tests run.
+- Unverified: sustained real modem airtime and retry behavior at 500 Hz.
+
+# 2026-10-21 checkpoint: compact KC2 records
+
+- Implemented: switched application records to KC2, replacing the JSON map
+  fallback with compact typed maps, varint integers, short key codes, and raw
+  128-bit station IDs/256-bit digests. Existing specialized message, image,
+  proof, inventory-summary, repair, receipt, and page-end layouts remain binary.
+  AX.25 record bundles now identify KC2 records.
+- Validation: `git diff --check`; no tests run.
+- Unverified: multi-station interoperability and measured airtime savings.

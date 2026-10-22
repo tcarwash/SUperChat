@@ -1,10 +1,9 @@
 """Compact application protocol carried inside Data2G broadcast KISS frames."""
 from __future__ import annotations
 
-import json
 import re
 
-MAGIC = b"KC1"
+MAGIC = b"KC2"
 MAX_FRAME = 220
 MIN_CHUNK_BYTES = 120
 MAX_MESSAGE_BYTES = 4096
@@ -15,10 +14,162 @@ IMAGE_CHUNK_BYTES = 139
 MAX_THUMBNAIL_BYTES = 8 * 1024
 MAX_CACHED_THUMBNAIL_BYTES = MAX_THUMBNAIL_BYTES
 CHANNEL_NAME = re.compile(r"^#[A-Za-z0-9_-]{1,31}$")
+_KEYS = ("t", "p", "n", "nick", "v", "l", "ttl", "sig", "o", "a", "m",
+         "to", "from", "s", "h", "b", "w", "hgt", "id", "i", "z", "c",
+         "ts", "d", "f", "u", "x", "r", "k", "g", "at", "by", "q",
+         "j", "proof", "version", "channel", "digest", "size", "width",
+         "height", "requester", "recipient", "attempt", "since", "through")
+_KEY_TO_ID = {key: index + 1 for index, key in enumerate(_KEYS)}
+_ID_TO_KEY = {value: key for key, value in _KEY_TO_ID.items()}
+_ID_TEXT = re.compile(r"^[0-9a-fA-F]{32}$")
+_DIGEST_TEXT = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _put_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("negative varint")
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _get_varint(data: bytes, offset: int) -> tuple[int, int]:
+    value = shift = 0
+    for _ in range(32):
+        if offset >= len(data):
+            raise ValueError("truncated varint")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+    raise ValueError("oversized varint")
+
+
+def _encode_value(value, depth: int = 0) -> bytes:
+    if depth > 8:
+        raise ValueError("record nesting is too deep")
+    if value is None:
+        return b"\x00"
+    if value is False:
+        return b"\x01"
+    if value is True:
+        return b"\x02"
+    if type(value) is int:
+        zigzag = value * 2 if value >= 0 else (-value * 2) - 1
+        return b"\x03" + _put_varint(zigzag)
+    if isinstance(value, bytes):
+        return b"\x05" + _put_varint(len(value)) + value
+    if isinstance(value, str):
+        if _ID_TEXT.fullmatch(value):
+            return b"\x08" + bytes.fromhex(value)
+        if _DIGEST_TEXT.fullmatch(value):
+            return b"\x09" + bytes.fromhex(value)
+        encoded = value.encode("utf-8")
+        return b"\x04" + _put_varint(len(encoded)) + encoded
+    if isinstance(value, (list, tuple)):
+        return b"\x06" + _put_varint(len(value)) + b"".join(
+            _encode_value(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return b"\x07" + _encode_map(value, depth + 1)
+    raise ValueError(f"unsupported protocol value: {type(value).__name__}")
+
+
+def _encode_map(value: dict, depth: int = 0) -> bytes:
+    if depth > 8 or len(value) > 255:
+        raise ValueError("record map is too large or nested too deeply")
+    out = bytearray((len(value),))
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise ValueError("protocol map keys must be strings")
+        key_bytes = key.encode("utf-8")
+        code = _KEY_TO_ID.get(key)
+        if code is None:
+            out.append(0)
+            out.extend(_put_varint(len(key_bytes)))
+            out.extend(key_bytes)
+        else:
+            out.append(code)
+        out.extend(_encode_value(item, depth))
+    return bytes(out)
+
+
+def _decode_value(data: bytes, offset: int, depth: int = 0):
+    if depth > 8 or offset >= len(data):
+        raise ValueError("truncated or deeply nested value")
+    kind = data[offset]
+    offset += 1
+    if kind == 0:
+        return None, offset
+    if kind == 1:
+        return False, offset
+    if kind == 2:
+        return True, offset
+    if kind == 3:
+        value, offset = _get_varint(data, offset)
+        return (-(value // 2) - 1 if value & 1 else value // 2), offset
+    if kind in (4, 5):
+        size, offset = _get_varint(data, offset)
+        end = offset + size
+        if end > len(data):
+            raise ValueError("truncated string or bytes")
+        raw = data[offset:end]
+        return (raw.decode("utf-8") if kind == 4 else raw), end
+    if kind in (8, 9):
+        size = 16 if kind == 8 else 32
+        end = offset + size
+        if end > len(data):
+            raise ValueError("truncated identifier")
+        return data[offset:end].hex(), end
+    if kind == 6:
+        count, offset = _get_varint(data, offset)
+        if count > MAX_FRAME:
+            raise ValueError("oversized list")
+        values = []
+        for _ in range(count):
+            item, offset = _decode_value(data, offset, depth + 1)
+            values.append(item)
+        return values, offset
+    if kind == 7:
+        mapping, offset = _decode_map(data, offset, depth + 1)
+        return mapping, offset
+    raise ValueError("unknown value type")
+
+
+def _decode_map(data: bytes, offset: int = 0, depth: int = 0) -> tuple[dict, int]:
+    if depth > 8 or offset >= len(data):
+        raise ValueError("truncated or deeply nested map")
+    count = data[offset]
+    offset += 1
+    result = {}
+    for _ in range(count):
+        if offset >= len(data):
+            raise ValueError("truncated map key")
+        code = data[offset]
+        offset += 1
+        if code == 0:
+            size, offset = _get_varint(data, offset)
+            end = offset + size
+            if end > len(data):
+                raise ValueError("truncated map key")
+            key = data[offset:end].decode("utf-8")
+            offset = end
+        else:
+            key = _ID_TO_KEY.get(code)
+            if key is None:
+                raise ValueError("unknown map key")
+        if key in result:
+            raise ValueError("duplicate map key")
+        result[key], offset = _decode_value(data, offset, depth + 1)
+    return result, offset
 
 
 def _message_chunk_limit(channel_bytes: int, nick_bytes: int, *, relay: bool = False) -> int:
-    # KC1D has a 48-byte fixed header; addressed KC1R records add one TTL byte.
+    # KC2D has a 48-byte fixed header; addressed KC2R records add one TTL byte.
     return MAX_FRAME - 48 - channel_bytes - nick_bytes - int(relay)
 
 
@@ -140,9 +291,7 @@ def pack(record: dict) -> bytes:
         if len(wire) > MAX_FRAME:
             raise ValueError(f"chat frame is too large ({len(wire)} > {MAX_FRAME} bytes)")
         return wire
-    wire = MAGIC + b"J" + json.dumps(
-        record, ensure_ascii=True, separators=(",", ":")
-    ).encode("ascii")
+    wire = MAGIC + b"M" + _encode_map(record)
     if len(wire) > MAX_FRAME:
         raise ValueError(f"chat frame is too large ({len(wire)} > {MAX_FRAME} bytes)")
     return wire
@@ -153,7 +302,13 @@ def unpack(wire: bytes) -> dict | None:
         return None
     if len(wire) > MAX_FRAME:
         return None
-    if len(wire) < 4 or wire[3:4] != b"J":
+    if len(wire) >= 5 and wire[3:4] == b"M":
+        try:
+            value, offset = _decode_map(wire, 4)
+            return value if offset == len(wire) and isinstance(value, dict) else None
+        except (UnicodeDecodeError, ValueError):
+            return None
+    if len(wire) < 4 or wire[3:4] != b"M":
         if wire[3:4] == b"K":
             if len(wire) < 21 or wire[20] > 8 or len(wire) != 21 + wire[20] * 24:
                 return None
@@ -319,11 +474,7 @@ def unpack(wire: bytes) -> dict | None:
                     "adaptive": adaptive}
         except (IndexError, UnicodeDecodeError):
             return None
-    try:
-        value = json.loads(wire[4:].decode("ascii"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
+    return None
 
 
 def message_parts(*, origin: str, seq: int, channel: str, nick: str,

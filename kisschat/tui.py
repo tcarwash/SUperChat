@@ -25,7 +25,7 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
 from textual.widgets import (Button, Checkbox, Footer, Input, Label, OptionList,
-                             RichLog, Static)
+                             RichLog, Select, Static)
 from textual.widgets.option_list import Option
 
 from .app import Chat
@@ -485,6 +485,20 @@ class ChatApp(App[None]):
                                value=self.chat.unattended,
                                disabled=getattr(self.chat.args, "transport", "broadcast") != "broadcast",
                                id="unattended-toggle")
+                yield Select([("Auto (widest under limit)", ""),
+                              *((f"{name} · {width:g} Hz", name)
+                                for name, width in self.chat.data.mode_catalog)],
+                             value=(self.chat.data.manual_mode or ""),
+                             allow_blank=False,
+                             disabled=getattr(self.chat.args, "transport", "broadcast") != "broadcast",
+                             id="broadcast-mode")
+                yield Select([("No maximum", "0"), ("500 Hz", "500"),
+                              ("1200 Hz", "1200"), ("2300 Hz", "2300"),
+                              ("2750 Hz", "2750")],
+                             value=str(getattr(self.chat.data, "max_bandwidth", None) or 0),
+                             allow_blank=False,
+                             disabled=getattr(self.chat.args, "transport", "broadcast") != "broadcast",
+                             id="broadcast-bandwidth")
                 yield Static("YOUR STATION", classes="eyebrow section-label")
                 yield Static(f"{self.chat.nick}\n{self.chat.args.callsign}", id="station-card")
                 yield Static("HEARD STATIONS", classes="eyebrow section-label")
@@ -582,6 +596,37 @@ class ChatApp(App[None]):
         finally:
             checkbox.disabled = (getattr(self.chat.args, "transport", "broadcast") != "broadcast" or
                                  not self.chat.data.unattended_available)
+
+    async def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "broadcast-mode":
+            mode = str(event.value)
+            if mode:
+                try:
+                    await asyncio.to_thread(self.chat.data.set_broadcast_mode, mode)
+                    self.chat.args.mode = mode
+                    self.last_status = f"Broadcast mode set to {mode}"
+                except Exception as exc:
+                    self.last_status = f"Could not change broadcast mode: {exc}"
+            self.query_one("#activity", Static).update(self._short_status(self.last_status))
+        elif event.select.id == "broadcast-bandwidth":
+            try:
+                value = int(event.value)
+                await asyncio.to_thread(self.chat.data.set_max_bandwidth, value or None)
+                self.chat.args.max_bandwidth = value or None
+                modes = [(name, width) for name, width in self.chat.data.mode_catalog
+                         if not value or width <= value]
+                mode_select = self.query_one("#broadcast-mode", Select)
+                mode_select.set_options([("Auto (widest under limit)", ""),
+                                         *((f"{name} · {width:g} Hz", name)
+                                           for name, width in modes)])
+                mode_select.value = self.chat.data.manual_mode or ""
+                self.last_status = (f"Broadcast maximum set to {value} Hz" if value
+                                    else "Broadcast maximum removed")
+            except Exception as exc:
+                self.last_status = f"Could not change bandwidth maximum: {exc}"
+                self.query_one("#broadcast-bandwidth", Select).value = str(
+                    self.chat.data.max_bandwidth or 0)
+            self.query_one("#activity", Static).update(self._short_status(self.last_status))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         # Some terminal emulators deliver a file drop as ordinary input rather
@@ -1104,6 +1149,15 @@ class ChatApp(App[None]):
                         str(value).startswith("Connected to raw KISS")):
                     self.query_one("#link-detail", Static).update(self._link_detail())
                     if self.chat.args.transport == "broadcast":
+                        mode_select = self.query_one("#broadcast-mode", Select)
+                        mode_select.set_options([
+                            ("Auto (widest under limit)", ""),
+                            *((f"{name} · {width:g} Hz", name)
+                              for name, width in self.chat.data.mode_catalog)])
+                        mode_select.value = self.chat.data.manual_mode or ""
+                        mode_select.disabled = not bool(self.chat.data.mode_catalog)
+                        self.query_one("#broadcast-bandwidth", Select).disabled = not bool(
+                            self.chat.data.mode_catalog)
                         self.query_one("#unattended-toggle", Checkbox).disabled = (
                             not self.chat.data.unattended_available)
                 status = str(value).lower()

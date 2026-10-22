@@ -37,8 +37,6 @@ SYNC_PAGE_REPAIR_LIMIT = 3
 SYNC_REQUEST_RETRY_SECONDS = 12
 MAX_SYNC_REQUEST_RETRIES = 3
 SYNC_HISTORY_SECONDS = 48 * 60 * 60
-AUTO_SYNC_INTERVAL_SECONDS = 45
-AUTO_SYNC_JITTER_SECONDS = 30
 HEARD_PEER_TTL = 15 * 60
 MAX_HEARD_PEERS = 512
 MAX_ANNOUNCED_ORIGINS = 8192
@@ -47,6 +45,7 @@ MAX_PENDING_SYNC_REQUESTS = 4096
 MAX_COMPLETED_SYNC_WINDOWS = 4096
 SYNC_WINDOW_RETRY_SECONDS = 300
 RELAY_ANNOUNCE_JITTER_SECONDS = 8
+SLOW_RELAY_ANNOUNCE_INTERVAL_SECONDS = 30
 MAX_IMAGE_REQUESTS = 4096
 MAX_IMAGE_CHUNKS_SEEN = 4096
 MAX_IMAGE_RESPONSE_TIMERS = 512
@@ -178,6 +177,7 @@ class Chat:
         self.seen_receipt_acks: dict[tuple[str, int, str, str], float] = {}
         self.last_announced: dict[str, float] = {}
         self.pending_announcements: dict[str, float] = {}
+        self.last_slow_relay_announcement = 0.0
         self.announce_lock = threading.Lock()
         self.inventory_cursor = 0
         self.attachment_cursor: tuple[str, int] = ("", 0)
@@ -190,6 +190,7 @@ class Chat:
                            kiss_port=kiss_port, mode=args.mode,
                            transport=getattr(args, "transport", "broadcast"),
                            bandwidth=getattr(args, "bandwidth", "2300"),
+                           max_bandwidth=getattr(args, "max_bandwidth", None),
                            ax25_destination=getattr(args, "ax25_destination", "CQ"),
                            digipeaters=tuple(filter(None, getattr(args, "digipeaters", "").split(","))),
                            kiss_tnc_port=getattr(args, "kiss_tnc_port", 0),
@@ -313,11 +314,26 @@ class Chat:
                                     ("w", self.store.node, 2))
         self.pending_local_delivery.clear()
 
+    def _slow_broadcast_mode(self) -> bool:
+        """True when the selected Data2G broadcast mode is 500 Hz or narrower."""
+        if getattr(self.args, "transport", "broadcast") != "broadcast":
+            return False
+        selected = self.data.auto_mode if self.unattended else self.data.manual_mode
+        width = next((width for name, width in self.data.mode_catalog
+                      if name == selected), None)
+        return width is not None and width <= 500
+
+    def _sync_retry_interval(self) -> int:
+        configured = getattr(self.args, "sync_retry_seconds", SYNC_REQUEST_RETRY_SECONDS)
+        return max(configured, 60) if self._slow_broadcast_mode() else configured
+
+    def _image_retry_interval(self) -> int:
+        return max(IMAGE_RETRY_SECONDS, 120) if self._slow_broadcast_mode() else IMAGE_RETRY_SECONDS
+
     def _sync_loop(self):
-        # Give new clients a chance to discover peers quickly, but randomize
-        # their first inventory exchange so a group started together does not
-        # transmit in lockstep. Later exchanges use the normal longer interval.
-        next_sync = time.monotonic() + 2 + secrets.randbelow(29)
+        # Randomize the first and later inventory exchanges so a group started
+        # together does not transmit in lockstep. Routine sync uses five minutes.
+        next_sync = time.monotonic() + 300 + secrets.randbelow(120 + 1)
         next_auth_policy_check = time.monotonic() + 2
         while not self.sync_stop.wait(0.25):
             self._expire_peer_sightings()
@@ -333,8 +349,8 @@ class Chat:
             if (self.auto_sync and time.monotonic() >= next_sync and
                     not self._receiving_image_window()):
                 self.sync(discover=False)
-                next_sync = (time.monotonic() + AUTO_SYNC_INTERVAL_SECONDS +
-                             secrets.randbelow(AUTO_SYNC_JITTER_SECONDS + 1))
+                next_sync = (time.monotonic() + 300 +
+                             secrets.randbelow(120 + 1))
 
     def send_record(self, record: dict, *, priority: int = 0,
                     operator_initiated: bool = False) -> bool:
@@ -405,9 +421,10 @@ class Chat:
             return
         start = self.inventory_cursor % len(inventory)
         inventory = inventory[start:] + inventory[:start]
+        frame_budget = 16 if self._slow_broadcast_mode() else MAX_INVENTORY_FRAMES_PER_ANNOUNCE
         sent_entries = 0
         if legacy:
-            for origin, low, high in inventory[:MAX_INVENTORY_FRAMES_PER_ANNOUNCE]:
+            for origin, low, high in inventory[:frame_budget]:
                 sent = self.send_record({"t": "i", "p": self.store.node,
                                          "n": self.args.callsign, "nick": self.nick,
                                          "o": origin, "a": low, "m": high, "ttl": 4,
@@ -426,7 +443,7 @@ class Chat:
             nonlocal batch, lows, frames_sent, sent_entries
             if not batch:
                 return True
-            if frames_sent >= MAX_INVENTORY_FRAMES_PER_ANNOUNCE:
+            if frames_sent >= frame_budget:
                 return False
             sent = self.send_record({"t": "i", "p": self.store.node,
                                      "n": self.args.callsign, "nick": self.nick,
@@ -456,7 +473,7 @@ class Chat:
                     break
                 batch = [[origin, high]]
                 lows = [low]
-                if frames_sent >= MAX_INVENTORY_FRAMES_PER_ANNOUNCE:
+                if frames_sent >= frame_budget:
                     break
             else:
                 batch = candidate
@@ -487,7 +504,7 @@ class Chat:
         if compact and not proof_mask:
             # A local live-message recovery hint needs only history bounds.
             # Keep full periodic inventories for station labels and signature
-            # discovery; use the existing KC1K format for this short hint.
+            # discovery; use the existing KC2K format for this short hint.
             sent = self.send_record({"t": "k", "from": self.store.node,
                                      "h": [[origin, low, high]]})
         else:
@@ -530,6 +547,13 @@ class Chat:
                     continue
                 if deadline > now:
                     continue
+                if self._slow_broadcast_mode():
+                    available_at = (self.last_slow_relay_announcement +
+                                    SLOW_RELAY_ANNOUNCE_INTERVAL_SECONDS)
+                    if now < available_at:
+                        jitter = secrets.randbelow(RELAY_ANNOUNCE_JITTER_SECONDS * 1000 + 1) / 1000
+                        self.pending_announcements[origin] = available_at + jitter
+                        continue
                 last = self.last_announced.get(origin, 0)
                 if now - last < 8:
                     jitter_ms = secrets.randbelow(RELAY_ANNOUNCE_JITTER_SECONDS * 1000 + 1)
@@ -537,6 +561,8 @@ class Chat:
                     continue
                 self.pending_announcements.pop(origin, None)
                 due.append(origin)
+                if self._slow_broadcast_mode():
+                    self.last_slow_relay_announcement = now
         for origin in due:
             if not self.announce_origin(origin, compact=origin == self.store.node):
                 with self.announce_lock:
@@ -647,8 +673,7 @@ class Chat:
 
     def _claim_sync_response(self, key: tuple, now: float) -> bool:
         """Coalesce repeated copies of one request while allowing its retry."""
-        retry_seconds = getattr(self.args, "sync_retry_seconds",
-                                SYNC_REQUEST_RETRY_SECONDS)
+        retry_seconds = self._sync_retry_interval()
         holdoff = max(0.25, min(2.0, retry_seconds / 2))
         with self.pending_lock:
             for old_key, expiry in list(self.served_sync_requests.items()):
@@ -667,12 +692,11 @@ class Chat:
         """Queue a page query and retain it for bounded timeout retries."""
         record = dict(record)
         if not record.get("v") and not record.get("j") and not record.get("r"):
-            # KC1H already carries ordinary windows with an empty repair list.
+            # KC2H already carries ordinary windows with an empty repair list.
             # Avoid a ~200-byte JSON query for a ~74-byte binary request.
             record.setdefault("h", [])
         now = time.monotonic()
-        retry_seconds = getattr(self.args, "sync_retry_seconds",
-                                SYNC_REQUEST_RETRY_SECONDS)
+        retry_seconds = self._sync_retry_interval()
         # Hidden stations hear the same inventory at the same instant. Their
         # retries must not stay synchronized after the first collision.
         retry_delay = retry_seconds * (1 + secrets.randbelow(1001) / 2000)
@@ -720,8 +744,7 @@ class Chat:
                     self.events.put(("status", "History page request timed out; use /sync to retry"))
                     continue
                 next_attempt = attempts + 1
-                retry_seconds = getattr(self.args, "sync_retry_seconds",
-                                        SYNC_REQUEST_RETRY_SECONDS)
+                retry_seconds = self._sync_retry_interval()
                 delay = retry_seconds * (2 ** attempts)
                 next_retry = now + delay * (1 + secrets.randbelow(1001) / 2000)
                 self.pending_sync_requests[key] = (record, route, next_retry, next_attempt)
@@ -751,7 +774,7 @@ class Chat:
     def _note_sync_progress(self, origin: str, seq: int) -> None:
         """Treat the page timer as a silence timeout while fragments arrive."""
         now = time.monotonic()
-        seconds = getattr(self.args, "sync_retry_seconds", SYNC_REQUEST_RETRY_SECONDS)
+        seconds = self._sync_retry_interval()
         deadline = now + seconds * (1 + secrets.randbelow(1001) / 2000)
         with self.pending_lock:
             for key, (record, route, retry_at, attempts) in list(self.pending_sync_requests.items()):
@@ -1071,7 +1094,7 @@ class Chat:
                 download_key = (origin, seq, digest)
                 if requester == self.store.node and download_key in self.pending_images:
                     attempt, _, expires = self.pending_images[download_key]
-                    self.pending_images[download_key] = (attempt, now + IMAGE_RETRY_SECONDS,
+                    self.pending_images[download_key] = (attempt, now + self._image_retry_interval(),
                                                          expires)
                 self._bound_timed_map(self.image_claims, now, MAX_IMAGE_REQUESTS)
                 timer = self.image_response_timers.get(request_key)
@@ -1751,7 +1774,7 @@ class Chat:
                 if int(record["i"]) in window:
                     window.discard(int(record["i"]))
                     attempt, _, expires = self.pending_images[key]
-                    self.pending_images[key] = (attempt, time.monotonic() + IMAGE_RETRY_SECONDS,
+                    self.pending_images[key] = (attempt, time.monotonic() + self._image_retry_interval(),
                                                 expires)
                     advance = not window
         if body is not None:
@@ -2154,6 +2177,8 @@ def main():
                         help="Data2G broadcast, VARA-compatible connected ARQ, or AX.25 UI over raw KISS")
     parser.add_argument("--bandwidth", choices=("500", "1200", "2300", "2750"),
                         default="2300", help="Data2G connected ARQ bandwidth cap in Hz")
+    parser.add_argument("--max-bandwidth", type=int,
+                        help="maximum Data2G broadcast mode bandwidth in Hz; selects the widest advertised mode within the limit")
     parser.add_argument("--command-port", type=int, default=8300)
     parser.add_argument("--kiss-port", type=int, default=(
         int(os.environ["KISSCHAT_KISS_PORT"])
