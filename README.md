@@ -20,9 +20,12 @@ does not advertise history on its first connection, so launching it remains
 receive-only until `/sync`, the first periodic sync, or a later reconnect.
 
 Messages have IRC style channels (`#general`, `#radio`, and so on), a display
-nick, and a local SQLite history. History sync advertises and serves only
-messages timestamped within the current 48-hour window (from `now - 48h` through
-`now`). Other records remain in local history. A foreground broadcast client starts in
+nick, and a local SQLite history. By default, history sync advertises and serves
+messages from the last 48 hours; `--sync-history-hours 24`, `4`, or `1` narrows
+that window, and the value is saved in the database. `--sync-history-messages N`
+sets a global cap across all origins for each sync exchange (`0` means unlimited);
+later exchanges can request more missing history. These settings limit radio
+sync only; other records remain in local history. A foreground broadcast client starts in
 receive mode without an initial inventory burst. It periodically exchanges
 history by default, which lets clients recover messages lost when stations
 transmit at the same time. Use `/sync` to retry incomplete exchanges now or
@@ -52,7 +55,7 @@ stagger listeners. Bounded retries use independent jitter, but
 shared radio airtime can still produce collisions. Always-on clients therefore act
 as store-and-forward nodes: a message can cross several stations and reach a
 client that was offline during the original conversation. Messages outside the
-current 48-hour window remain in local history but are not advertised or
+configured history window remain in local history but are not advertised or
 requested by routine sync. No server is required.
 Large origin inventories are announced in bounded rotating batches and use the
 bulk transmit queue, so later history origins get airtime without delaying new
@@ -709,7 +712,9 @@ New arrivals have a subtle background that fades over 12 seconds. Nickname color
 and symbols distinguish your messages (purple), directly heard messages (teal),
 and relayed messages (amber, ↪). A neutral question mark means the path is unknown.
 Raw AX.25 reception retains source and digipeater evidence for this distinction;
-older stored messages and transports without source metadata remain unknown.
+a directly heard unaddressed message also identifies its origin without waiting
+for an inventory. Older stored messages and transports without source metadata
+remain unknown.
 Reception colors describe the path, independently of signature verification.
 KISS ACKMODE receipts pace the broadcast writer with at most 32 frames in
 flight. A receipt confirms only that Data2G sent a frame on air; it does not

@@ -37,6 +37,8 @@ SYNC_PAGE_REPAIR_LIMIT = 3
 SYNC_REQUEST_RETRY_SECONDS = 12
 MAX_SYNC_REQUEST_RETRIES = 3
 SYNC_HISTORY_SECONDS = 48 * 60 * 60
+DEFAULT_SYNC_HISTORY_HOURS = SYNC_HISTORY_SECONDS // 3600
+MAX_SYNC_HISTORY_HOURS = 24 * 3650
 HEARD_PEER_TTL = 15 * 60
 MAX_HEARD_PEERS = 512
 MAX_ANNOUNCED_ORIGINS = 8192
@@ -111,6 +113,14 @@ class Chat:
             raise ValueError("connected transport needs command port + 1 for data")
         os.makedirs(os.path.dirname(os.path.abspath(args.db)), exist_ok=True)
         self.store = Store(args.db, args.callsign)
+        self.sync_history_hours = self._load_sync_setting(
+            args, "sync_history_hours", "sync_history_hours",
+            DEFAULT_SYNC_HISTORY_HOURS, MAX_SYNC_HISTORY_HOURS, minimum=1)
+        history_message_limit = self._load_sync_setting(
+            args, "sync_history_messages", "sync_history_messages", 0, 1_000_000)
+        self.sync_history_messages = history_message_limit or None
+        self.sync_history_budget_remaining = self.sync_history_messages
+        self.sync_history_budget_generation = 0
         saved_unattended = self.store.saved_setting("unattended")
         self.unattended = (True if getattr(args, "unattended", False) else
                            saved_unattended == "1" if saved_unattended is not None else False)
@@ -291,6 +301,10 @@ class Chat:
             return
         now = time.monotonic()
         with self.pending_lock:
+            if retry or (not self.pending_sync_requests and
+                         not self.pending_sync_windows):
+                self.sync_history_budget_remaining = self.sync_history_messages
+                self.sync_history_budget_generation += 1
             if retry:
                 # An explicit user sync is also a retry for pages whose query
                 # or response was lost. Leave routine/automatic syncs damped.
@@ -313,6 +327,31 @@ class Chat:
             self._send_routed_record({"t": "w", "p": self.store.node, "v": 2, "ttl": 0},
                                     ("w", self.store.node, 2))
         self.pending_local_delivery.clear()
+
+    def _load_sync_setting(self, args, option: str, key: str, default: int,
+                           maximum: int, *, minimum: int = 0) -> int:
+        configured = getattr(args, option, None)
+        saved = None if configured is not None else self.store.saved_setting(key)
+        raw = configured if configured is not None else saved
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            if configured is not None:
+                raise ValueError(f"{option.replace('_', '-')} must be an integer")
+            return default
+        if not minimum <= value <= maximum:
+            raise ValueError(
+                f"{option.replace('_', '-')} must be between {minimum} and {maximum}")
+        if configured is not None:
+            self.store.save_setting(key, str(value))
+        return value
+
+    def _history_since(self, now_epoch: int | None = None) -> int:
+        now = int(time.time()) if now_epoch is None else now_epoch
+        hours = getattr(self, "sync_history_hours", DEFAULT_SYNC_HISTORY_HOURS)
+        return now - hours * 3600
 
     def _slow_broadcast_mode(self) -> bool:
         """True when the selected Data2G broadcast mode is 500 Hz or narrower."""
@@ -392,7 +431,7 @@ class Chat:
             self._announce_attachment_metadata()
 
     def _announce_attachment_metadata(self, origin: str | None = None) -> None:
-        since = int(time.time()) - SYNC_HISTORY_SECONDS
+        since = self._history_since()
         after = self.attachment_cursor if origin is None else ("", 0)
         attachment = self.store.next_attachment_announcement(since, origin=origin, after=after)
         if attachment is None and origin is None and after != ("", 0):
@@ -415,7 +454,7 @@ class Chat:
                    self.store.has_proofs(origin))
 
     def _announce_inventory(self, *, legacy: bool = False):
-        since = int(time.time()) - SYNC_HISTORY_SECONDS
+        since = self._history_since()
         inventory = self.store.inventory(since)
         if not inventory:
             return
@@ -484,7 +523,7 @@ class Chat:
 
     def announce_origin(self, origin: str, *, force: bool = False,
                         high: int | None = None, compact: bool = False):
-        since = int(time.time()) - SYNC_HISTORY_SECONDS
+        since = self._history_since()
         bounds = self.store.recent_bounds(origin, since)
         if bounds is None:
             return True
@@ -501,22 +540,23 @@ class Chat:
         if high is None:
             high = self.store.highwater(origin)
         proof_mask = self._proof_mask([origin])
+        advertised_low = low
         if compact and not proof_mask:
-            # A local live-message recovery hint needs only history bounds.
-            # Keep full periodic inventories for station labels and signature
-            # discovery; use the existing KC2K format for this short hint.
+            # Compact inventory bounds let peers compare their contiguous
+            # sequence with the latest one we have and request only the gap.
             sent = self.send_record({"t": "k", "from": self.store.node,
-                                     "h": [[origin, low, high]]})
+                                     "h": [[origin, advertised_low, high]]})
         else:
             sent = self.send_record({"t": "i", "p": self.store.node,
                                      "n": self.args.callsign, "nick": self.nick,
-                                     "o": origin, "a": low, "m": high,
+                                     "o": origin, "a": advertised_low, "m": high,
                                      "ttl": 4, "sig": proof_mask})
         if not sent:
             with self.announce_lock:
                 self.last_announced.pop(origin, None)
         else:
-            self._debug_log("ORIGIN_ANNOUNCE", {"o": origin, "low": low, "high": high,
+            self._debug_log("ORIGIN_ANNOUNCE", {"o": origin, "low": advertised_low,
+                                                 "high": high,
                                                  "compact": compact and not proof_mask})
             self._announce_attachment_metadata(origin)
         return sent
@@ -876,10 +916,9 @@ class Chat:
         if not delivery_queued:
             self.pending_local_delivery.set()
         else:
-            # Piggyback a compact, bounded snapshot of recent history on every
-            # newly published message. Peers can request records we have while
-            # their next periodic inventory exchange is still pending.
-            since = int(time.time()) - SYNC_HISTORY_SECONDS
+            # Advertise the latest bounds for a rotating set of known origins.
+            # Peers request only the sequence range beyond their local cursor.
+            since = self._history_since()
             inventory = self.store.inventory(since)
             start = seq % len(inventory) if inventory else 0
             summary = (inventory[start:] + inventory[:start])[:8]
@@ -894,10 +933,7 @@ class Chat:
                 self._queue_signature(dict(message))
             except RuntimeError as exc:
                 self.events.put(("status", f"ARAP signing could not be queued: {exc}"))
-        # The message and its first inventory announcement can collide at a
-        # hidden-terminal relay. Re-advertise this origin once after the normal
-        # relay jitter so peers can fetch it without waiting for periodic sync.
-        self._queue_relay_announcement(self.store.node)
+
 
     def queue_image(self, path: str, caption: str = "") -> None:
         """Prepare and publish a thumbnail without blocking the chat UI."""
@@ -941,9 +977,10 @@ class Chat:
         if kind == "k":
             peer = str(record.get("from", ""))
             if peer and peer != self.store.node:
-                for origin, low, high in record.get("h", []):
-                    self._handle_inventory_entry(peer, str(origin), int(low),
-                                                 int(high), ttl=4, probe_proofs=False)
+                entries = [(str(origin), int(low), int(high))
+                           for origin, low, high in record.get("h", [])]
+                self._handle_inventory_entries(peer, entries, ttl=4,
+                                               probe_proofs=False)
             return
         if kind == "p":
             ttl = int(record.get("ttl", 4))
@@ -984,6 +1021,15 @@ class Chat:
                 else:
                     self._suppress_duplicate_message_relay(key, ttl)
                 return
+            source = (reception or {}).get("source")
+            origin = record.get("o", "")
+            if (not recipient and source and not (reception or {}).get("repeated") and
+                    isinstance(origin, str) and NODE_ID.fullmatch(origin)):
+                # Unaddressed message fragments are sent by their origin. Learn
+                # the radio-source mapping here instead of waiting for a separate
+                # inventory, which may be lost or arrive after the message.
+                if self.store.note_origin_station(origin, source):
+                    self.events.put(("reception", None))
             self._note_sync_progress(record["o"], int(record["s"]))
             result = self.store.add_fragment(record, reception)
             if result:
@@ -1168,8 +1214,7 @@ class Chat:
                         signature_mask & (1 << signature_indexes.get(origin, index)))
                     while len(self.peer_proofs) > MAX_ANNOUNCED_ORIGINS:
                         self.peer_proofs.pop(next(iter(self.peer_proofs)))
-                self._handle_inventory_entry(peer, origin, low, high,
-                                             ttl=inventory_ttl)
+            self._handle_inventory_entries(peer, origins, ttl=inventory_ttl)
             # A cache announces its own inventory after storing new data.
             # Flooded copies cannot serve a one-hop broadcast history page.
         elif kind == "q":
@@ -1179,10 +1224,10 @@ class Chat:
             through = int(record.get("b", 0))
             now_epoch = int(time.time())
             try:
-                requested_since = int(record.get("d", now_epoch - SYNC_HISTORY_SECONDS))
+                requested_since = int(record.get("d", self._history_since(now_epoch)))
             except (TypeError, ValueError):
-                requested_since = now_epoch - SYNC_HISTORY_SECONDS
-            since = min(now_epoch, max(requested_since, now_epoch - SYNC_HISTORY_SECONDS))
+                requested_since = self._history_since(now_epoch)
+            since = min(now_epoch, max(requested_since, self._history_since(now_epoch)))
             proof_page = bool(record.get("v"))
             target = record.get("to", "")
             repair_sequences = record.get("r", [])
@@ -1326,9 +1371,9 @@ class Chat:
             # advertised window. Keep paging bounded to the requested window.
             through = int(record.get("u", record.get("m", record.get("b", 0))))
             try:
-                since = int(record.get("d", int(time.time()) - SYNC_HISTORY_SECONDS))
+                since = int(record.get("d", self._history_since()))
             except (TypeError, ValueError):
-                since = int(time.time()) - SYNC_HISTORY_SECONDS
+                since = self._history_since()
             last_returned = int(record.get("b", 0))
             window_ceiling = int(record.get("u", through))
             window_start = int(record.get("f", after))
@@ -1492,13 +1537,68 @@ class Chat:
     def _handle_inventory_entry(self, peer: str, origin: str, low: int,
                                 high: int, *, ttl: int = 4,
                                 probe_proofs: bool = True) -> None:
+        self._handle_inventory_entries(peer, [(origin, low, high)], ttl=ttl,
+                                       probe_proofs=probe_proofs)
+
+    def _handle_inventory_entries(self, peer: str, entries, *, ttl: int = 4,
+                                  probe_proofs: bool = True) -> None:
+        if ttl < 4:
+            return
+        entries = list(entries)
+        now = time.monotonic()
+        with self.pending_lock:
+            self.completed_sync_windows = {
+                key: expiry for key, expiry in self.completed_sync_windows.items()
+                if expiry > now
+            }
+            self.pending_sync_windows = {
+                key: state for key, state in self.pending_sync_windows.items()
+                if state[1] > now
+            }
+            completed = set(self.completed_sync_windows)
+            active = {(key[0], key[1]) for key in self.pending_sync_windows}
+
+        # Split the remaining global budget across the advertised origins so
+        # the first stream cannot consume every history slot in the exchange.
+        candidates = []
+        for index, (origin, low, high) in enumerate(entries):
+            after = max(self.store.contiguous(origin), low - 1)
+            window = (origin, low - 1, high)
+            if high > after and window not in completed and (origin, low - 1) not in active:
+                candidates.append((index, high - after))
+
+        limits = {}
+        with self.pending_lock:
+            remaining = self.sync_history_budget_remaining
+        if remaining is None:
+            limits = {index: None for index, _ in candidates}
+        else:
+            candidates_left = len(candidates)
+            for index, requested in candidates:
+                quota = max(1, remaining // candidates_left) if candidates_left else 0
+                amount = min(requested, quota, remaining)
+                limits[index] = amount
+                remaining -= amount
+                candidates_left -= 1
+
+        for index, (origin, low, high) in enumerate(entries):
+            after = max(self.store.contiguous(origin), low - 1)
+            request_limit = limits.get(index, 0 if high > after else None)
+            self._handle_inventory_entry_limited(
+                peer, origin, low, high, ttl=ttl, probe_proofs=probe_proofs,
+                request_limit=request_limit)
+
+    def _handle_inventory_entry_limited(self, peer: str, origin: str, low: int,
+                                        high: int, *, ttl: int = 4,
+                                        probe_proofs: bool = True,
+                                        request_limit: int | None = None) -> None:
         # A forwarded inventory is useful gossip, but its owner may be outside
         # radio range. Ask a station that directly announced a cached copy so
         # the broadcast page can reach this node in one hop.
         if ttl < 4:
             return
         local = self.store.contiguous(origin)
-        since = int(time.time()) - SYNC_HISTORY_SECONDS
+        since = self._history_since()
         local_recent = self.store.highwater(origin, since)
         after = max(local, low - 1)
         window_start = low - 1
@@ -1514,32 +1614,52 @@ class Chat:
                 key: state for key, state in self.pending_sync_windows.items()
                 if state[1] > now
             }
-            active_window = window_key in self.pending_sync_windows
+            active_window = any(key[0] == origin and key[1] == window_start
+                                for key in self.pending_sync_windows)
         if already_synced or active_window:
             if already_synced and probe_proofs:
                 self._request_recent_proofs(peer, origin, low, high)
             return
         if high > after:
-            through = high
+            requested = high - after
             request = (peer, origin, after)
-            request_record = {"t": "q", "to": peer, "from": self.store.node,
-                              "o": origin, "a": after, "b": through,
-                              "d": since, "f": window_start, "u": through,
-                              "ttl": 0}
             with self.pending_lock:
                 # Only one neighbor should serve a given origin window. This
                 # prevents a relay and the origin from both sending the same
                 # batch when their inventories arrive close together.
-                if window_key in self.pending_sync_windows:
+                if any(key[0] == origin and key[1] == window_start
+                       for key in self.pending_sync_windows):
                     return
-                self.pending_sync_windows[window_key] = (
+                remaining = self.sync_history_budget_remaining
+                amount = requested if remaining is None else min(requested, remaining)
+                if request_limit is not None:
+                    amount = min(amount, request_limit)
+                if amount <= 0:
+                    return
+                through = after + amount
+                request_window = (origin, window_start, through)
+                if request_window in self.pending_sync_windows:
+                    return
+                if remaining is not None:
+                    self.sync_history_budget_remaining = remaining - amount
+                budget_generation = self.sync_history_budget_generation
+                self.pending_sync_windows[request_window] = (
                     peer, now + SYNC_WINDOW_RETRY_SECONDS)
+            request_record = {"t": "q", "to": peer, "from": self.store.node,
+                              "o": origin, "a": after, "b": through,
+                              "d": since, "f": window_start, "u": through,
+                              "ttl": 0}
             if not self._send_sync_request(
                 request_record, request,
                 ("q", self.store.node, peer, origin, after, through, False, ())):
                 with self.pending_lock:
-                    if self.pending_sync_windows.get(window_key, (None,))[0] == peer:
-                        self.pending_sync_windows.pop(window_key, None)
+                    if self.pending_sync_windows.get(request_window, (None,))[0] == peer:
+                        self.pending_sync_windows.pop(request_window, None)
+                    if (self.sync_history_budget_generation == budget_generation and
+                            self.sync_history_budget_remaining is not None):
+                        self.sync_history_budget_remaining = min(
+                            self.sync_history_messages or 0,
+                            self.sync_history_budget_remaining + amount)
         elif local_recent > high:
             # Tell the mesh this station can serve history the advertising
             # peer lacks; do not wait for the next periodic inventory round.
@@ -1677,7 +1797,7 @@ class Chat:
         if self.peer_proofs.get((peer, origin)) is False:
             return
         rows = self.store.messages_between(origin, after, through, limit=20,
-                                          since=int(time.time()) - SYNC_HISTORY_SECONDS)
+                                          since=self._history_since())
         if rows and all(self.store.proof_for(origin, int(row["s"])) for row in rows):
             return
         key = (peer, origin, after)
@@ -1691,7 +1811,7 @@ class Chat:
                 return
         request_record = {"t": "q", "to": peer, "from": self.store.node,
                           "o": origin, "a": after, "b": through,
-                          "d": int(time.time()) - SYNC_HISTORY_SECONDS,
+                          "d": self._history_since(),
                           "v": 1, "ttl": 0}
         sent = self._send_routed_record(
             request_record, ("q", self.store.node, peer, origin, after, through, True, ()))
@@ -2199,6 +2319,10 @@ def main():
                         default=float(os.getenv("KISSCHAT_AX25_INTERFRAME_DELAY") or "0.25"),
                         help="extra seconds between estimated AX.25 frames (default 0.25)")
     parser.add_argument("--db", default=os.path.expanduser("~/.local/share/kisschat/chat.sqlite3"))
+    parser.add_argument("--sync-history-hours", type=int,
+                        help=f"maximum age of history to advertise/request/serve (1-{MAX_SYNC_HISTORY_HOURS} hours; default 48; saved in the database)")
+    parser.add_argument("--sync-history-messages", type=int,
+                        help="maximum sequence slots requested across all origins per sync exchange (0 means unlimited; saved in the database)")
     parser.add_argument("--debug-log", default="",
                         help="append timestamped transport and protocol events to this file")
     parser.add_argument("--arap-cli", default=os.getenv("ARAP_CLI", "arap"),
@@ -2221,6 +2345,10 @@ def main():
                         help="disable periodic history exchange")
     parser.set_defaults(auto_sync=True)
     args = parser.parse_args()
+    if args.sync_history_hours is not None and not 1 <= args.sync_history_hours <= MAX_SYNC_HISTORY_HOURS:
+        parser.error(f"--sync-history-hours must be between 1 and {MAX_SYNC_HISTORY_HOURS}")
+    if args.sync_history_messages is not None and not 0 <= args.sync_history_messages <= 1_000_000:
+        parser.error("--sync-history-messages must be between 0 and 1000000")
     if args.debug_log:
         args.debug_log = os.path.abspath(os.path.expanduser(args.debug_log))
         try:

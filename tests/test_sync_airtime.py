@@ -11,6 +11,8 @@ from scripts.simulate_mesh import make_args
 
 class RecordingRadio:
     port = 0
+    manual_mode = None
+    mode_catalog = ()
 
     def __init__(self):
         self.sent = []
@@ -121,10 +123,116 @@ class SyncAirtimeTests(unittest.TestCase):
         self.assertEqual([r['t'] for r in self.records()], ['i'])
         self.assertEqual(self.records()[0]['sig'], 0)
 
-    def test_publish_bundles_body_and_summary_then_defers_inventory(self):
-        self.chat.publish('hello')
-        self.assertEqual([r['t'] for r in self.records()], ['d', 'k'])
-        self.assertIn(self.chat.store.node, self.chat.pending_announcements)
+    def test_publish_advertises_highwater_and_serves_only_missing_messages(self):
+        timestamp = int(time.time())
+        for seq in range(1, 16):
+            self.chat.store.insert(self.origin, seq, '#general', 'Bob',
+                                   timestamp, f'history {seq}')
+
+        receiver = Chat(make_args('B', 'Bob', self.temp.name + '/b.sqlite'))
+        receiver.data = RecordingRadio()
+        self.addCleanup(receiver.close)
+        for seq in range(1, 11):
+            receiver.store.insert(self.origin, seq, '#general', 'Bob',
+                                  timestamp, f'history {seq}')
+
+        with patch('kisschat.app.secrets.randbelow', return_value=0):
+            self.chat.publish('new message')
+        published = self.records()
+        self.assertEqual([r['t'] for r in published], ['d', 'k'])
+        self.assertIn([self.origin, 1, 15], published[1]['h'])
+        self.assertIn([self.chat.store.node, 1, 1], published[1]['h'])
+
+        receiver._on_frame(0, self.chat.data.sent[0][0])
+        receiver._on_frame(0, self.chat.data.sent[1][0])
+        requests = [unpack(payload) for payload, _ in receiver.data.sent]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]['o'], self.origin)
+        self.assertEqual((requests[0]['a'], requests[0]['b']), (10, 15))
+
+        self.chat.data.sent.clear()
+        self.chat._on_frame(0, receiver.data.sent[0][0])
+        response = self.records()
+        message_response = [r for r in response if r['t'] == 'd']
+        self.assertEqual([r['s'] for r in message_response], list(range(11, 16)))
+        self.assertTrue(all(r['o'] == self.origin for r in message_response))
+        self.assertEqual(response[-1]['t'], 'e')
+
+    def test_history_sync_settings_persist_for_the_database(self):
+        args = make_args('B', 'Bob', self.temp.name + '/settings.sqlite')
+        args.sync_history_hours = 4
+        args.sync_history_messages = 25
+        configured = Chat(args)
+        configured.data = RecordingRadio()
+        self.addCleanup(configured.close)
+        self.assertEqual(configured.sync_history_hours, 4)
+        self.assertEqual(configured.sync_history_messages, 25)
+
+        reopened = Chat(make_args('B', 'Bob', self.temp.name + '/settings.sqlite'))
+        reopened.data = RecordingRadio()
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.sync_history_hours, 4)
+        self.assertEqual(reopened.sync_history_messages, 25)
+
+    def test_history_message_budget_is_global_across_origins(self):
+        args = make_args('B', 'Bob', self.temp.name + '/limited.sqlite')
+        args.sync_history_messages = 3
+        receiver = Chat(args)
+        receiver.data = RecordingRadio()
+        self.addCleanup(receiver.close)
+        other_origin = '04' * 16
+        timestamp = int(time.time())
+        for origin in (self.origin, other_origin):
+            for seq in range(1, 11):
+                self.chat.store.insert(origin, seq, '#general', 'Alice', timestamp,
+                                       f'{origin[:2]} message {seq}')
+        receiver._on_frame(0, pack({
+            't': 'k', 'from': self.chat.store.node,
+            'h': [[self.origin, 1, 10], [other_origin, 1, 10]],
+        }))
+
+        requests = [unpack(payload) for payload, _ in receiver.data.sent]
+        self.assertEqual(len(requests), 2)
+        self.assertEqual([request['b'] - request['a'] for request in requests], [1, 2])
+        self.assertEqual(sum(request['b'] - request['a'] for request in requests), 3)
+        self.chat.data.sent.clear()
+        for payload, _ in receiver.data.sent:
+            self.chat._on_frame(0, payload)
+        sent_messages = [unpack(payload) for payload, _ in self.chat.data.sent
+                         if unpack(payload)['t'] == 'd']
+        self.assertEqual(len(sent_messages), 3)
+
+        receiver.data.sent.clear()
+        receiver.sync(retry=True, discover=False)
+        next_origin = '05' * 16
+        receiver._on_frame(0, pack({
+            't': 'k', 'from': self.peer,
+            'h': [[next_origin, 1, 10]],
+        }))
+        next_requests = [unpack(payload) for payload, _ in receiver.data.sent]
+        self.assertEqual(len(next_requests), 1)
+        self.assertEqual((next_requests[0]['a'], next_requests[0]['b']), (0, 3))
+
+    def test_responder_applies_configured_history_age_cutoff(self):
+        args = make_args('B', 'Bob', self.temp.name + '/cutoff.sqlite')
+        args.sync_history_hours = 4
+        responder = Chat(args)
+        responder.data = RecordingRadio()
+        self.addCleanup(responder.close)
+        now = int(time.time())
+        responder.store.insert(self.origin, 1, '#general', 'Bob', now - 6 * 3600,
+                               'outside cutoff')
+        responder.store.insert(self.origin, 2, '#general', 'Bob', now - 3 * 3600,
+                               'inside cutoff')
+        responder._on_frame(0, pack({
+            't': 'q', 'to': responder.store.node, 'from': self.peer,
+            'o': self.origin, 'a': 0, 'b': 2, 'd': now - 48 * 3600,
+            'ttl': 0,
+        }))
+
+        response = [unpack(payload) for payload, _ in responder.data.sent]
+        message_rows = [record for record in response if record['t'] == 'd']
+        self.assertEqual([record['s'] for record in message_rows], [2])
 
     def test_signature_can_be_repaired_after_message_window_completed(self):
         self.chat.store.insert(self.origin, 1, '#general', 'Bob', int(time.time()), 'hello')
