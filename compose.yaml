@@ -14,6 +14,9 @@ services:
       KISSCHAT_DIGIPEATERS: ${KISSCHAT_DIGIPEATERS:-}
       KISSCHAT_AX25_BAUD: ${KISSCHAT_AX25_BAUD:-1200}
       KISSCHAT_AX25_INTERFRAME_DELAY: ${KISSCHAT_AX25_INTERFRAME_DELAY:-0.25}
+      KISSCHAT_DORCBOT_URL: ${KISSCHAT_DORCBOT_URL:-}
+      KISSCHAT_DORCBOT_TOKEN: ${KISSCHAT_DORCBOT_TOKEN:-}
+      KISSCHAT_DORCBOT_MENTION: ${KISSCHAT_DORCBOT_MENTION:-dorcbot}
     command: ["--host", "${KISSCHAT_HOST:-${DATA2G_HOST:-127.0.0.1}}", "--callsign", "${CALLSIGN:?Set CALLSIGN}", "--transport", "${KISSCHAT_TRANSPORT:-broadcast}", "--bandwidth", "${KISSCHAT_BANDWIDTH:-2300}"]
     volumes:
       - kisschat-data:/home/kisschat/.local/share/kisschat
@@ -33,6 +36,9 @@ services:
       KISSCHAT_DIGIPEATERS: ${KISSCHAT_DIGIPEATERS:-}
       KISSCHAT_AX25_BAUD: ${KISSCHAT_AX25_BAUD:-1200}
       KISSCHAT_AX25_INTERFRAME_DELAY: ${KISSCHAT_AX25_INTERFRAME_DELAY:-0.25}
+      KISSCHAT_DORCBOT_URL: ${KISSCHAT_DORCBOT_URL:-}
+      KISSCHAT_DORCBOT_TOKEN: ${KISSCHAT_DORCBOT_TOKEN:-}
+      KISSCHAT_DORCBOT_MENTION: ${KISSCHAT_DORCBOT_MENTION:-dorcbot}
     command: ["--host", "${KISSCHAT_HOST:-${DATA2G_HOST:-127.0.0.1}}", "--callsign", "${CALLSIGN:?Set CALLSIGN}", "--transport", "${KISSCHAT_TRANSPORT:-broadcast}", "--bandwidth", "${KISSCHAT_BANDWIDTH:-2300}", "--headless"]
     volumes:
       - kisschat-data:/home/kisschat/.local/share/kisschat

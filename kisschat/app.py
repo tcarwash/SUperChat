@@ -5,6 +5,8 @@ import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import json
+import urllib.error
+import urllib.request
 import os
 import queue
 import re
@@ -156,6 +158,8 @@ class Chat:
                                                 thread_name_prefix="kisschat-arap")
         self.image_executor = ThreadPoolExecutor(max_workers=1,
                                                  thread_name_prefix="kisschat-image")
+        self.dorcbot_executor = ThreadPoolExecutor(max_workers=1,
+                                                   thread_name_prefix="kisschat-dorcbot")
         self.image_slots = threading.BoundedSemaphore(2)
         self.auth_pending: dict[tuple[str, int], tuple[bytes, str]] = {}
         self.auth_checked: dict[tuple[str, int], tuple[bytes, str]] = {}
@@ -228,6 +232,9 @@ class Chat:
                            on_frame_context=self._on_frame,
                            on_status=self._on_data_status,
                            on_debug=self._debug_log if getattr(args, "debug_log", "") else None)
+        self.dorcbot_url = getattr(args, "dorcbot_url", "").rstrip("/")
+        self.dorcbot_token = getattr(args, "dorcbot_token", "")
+        self.dorcbot_mention = getattr(args, "dorcbot_mention", "dorcbot").casefold()
 
     def station_names(self) -> list[str]:
         with self.peer_lock:
@@ -282,9 +289,46 @@ class Chat:
             if message["o"] == self.store.node:
                 continue
             for mention in self._mentioned_here(message["b"]):
-                self.store.add_relay_receipt(message["o"], int(message["s"]),
-                                             self.store.node, self.args.callsign,
-                                             mention, received_at)
+                if self._is_dorcbot_mention(mention):
+                    # Pending bridge work is durable already. Do not replay
+                    # old synchronized history merely because this station
+                    # was configured for the bridge after those messages arrived.
+                    continue
+                else:
+                    self.store.add_relay_receipt(message["o"], int(message["s"]),
+                                                 self.store.node, self.args.callsign,
+                                                 mention, received_at)
+        self.dorcbot_executor.submit(self._dispatch_dorcbot_deliveries)
+
+    def _is_dorcbot_mention(self, mention: str) -> bool:
+        return bool(self.dorcbot_url and self.dorcbot_token and
+                    mention.casefold() == self.dorcbot_mention)
+
+    def _dispatch_dorcbot_deliveries(self) -> None:
+        for message in self.store.claim_dorcbot_deliveries(int(time.time())):
+            if not self.dorcbot_url or not self.dorcbot_token:
+                continue
+            payload = {key: message[key] for key in ("o", "s", "c", "n", "b")}
+            payload = {"origin": payload["o"], "seq": payload["s"],
+                       "channel": payload["c"], "nick": payload["n"], "body": payload["b"]}
+            request = urllib.request.Request(
+                self.dorcbot_url + "/kisschat/message",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Authorization": "Bearer " + self.dorcbot_token,
+                         "Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    if response.status < 200 or response.status >= 300:
+                        raise OSError(f"DORCbot returned HTTP {response.status}")
+            except (OSError, urllib.error.URLError, TimeoutError) as exc:
+                self.events.put(("status", f"DORCbot delivery pending: {exc}"))
+                continue
+            self.store.add_relay_receipt(message["o"], int(message["s"]),
+                                         self.store.node, self.args.callsign,
+                                         message["mention"], int(time.time()))
+            self.store.finish_dorcbot_delivery(message["o"], int(message["s"]),
+                                               message["mention"])
+            self._forward_pending_receipts()
 
     def _on_data_status(self, value: str):
         self._debug_log("STATUS", value)
@@ -397,6 +441,7 @@ class Chat:
         # Randomize the first and later inventory exchanges so a group started
         # together does not transmit in lockstep. Routine sync uses five minutes.
         next_sync = time.monotonic() + 300 + secrets.randbelow(120 + 1)
+        next_dorcbot_retry = time.monotonic() + 5
         next_auth_policy_check = time.monotonic() + 2
         while not self.sync_stop.wait(0.25):
             self._expire_peer_sightings()
@@ -404,6 +449,9 @@ class Chat:
             self._flush_message_relays()
             self._flush_end_relays()
             self._retry_pending_images()
+            if time.monotonic() >= next_dorcbot_retry:
+                self.dorcbot_executor.submit(self._dispatch_dorcbot_deliveries)
+                next_dorcbot_retry = time.monotonic() + 5
             self._retry_pending_sync_requests()
             if time.monotonic() >= next_auth_policy_check:
                 self._refresh_auth_policy()
@@ -1156,7 +1204,12 @@ class Chat:
                     # Rate limiting coalesces batches of synced history.
                     self._queue_relay_announcement(message["o"])
                     for target in mention_targets:
-                        self._create_receipt(message, target)
+                        if self._is_dorcbot_mention(target):
+                            self.store.queue_dorcbot_delivery(
+                                message["o"], int(message["s"]), target)
+                            self.dorcbot_executor.submit(self._dispatch_dorcbot_deliveries)
+                        else:
+                            self._create_receipt(message, target)
                 if message["o"] != self.store.node:
                     try:
                         card_reference = decode_pixel_card_reference(message["b"])
@@ -1943,6 +1996,8 @@ class Chat:
 
     def _mentioned_here(self, body: str) -> list[str]:
         identities = {self.args.callsign.casefold(), self.nick.casefold()}
+        if self.dorcbot_url and self.dorcbot_token:
+            identities.add(self.dorcbot_mention)
         mentions = []
         seen = set()
         for match in MENTION.finditer(body):
@@ -2686,6 +2741,7 @@ class Chat:
                 timer.cancel()
             self.image_response_timers.clear()
         self.image_executor.shutdown(wait=True, cancel_futures=False)
+        self.dorcbot_executor.shutdown(wait=True, cancel_futures=False)
         self.data.close()
         self.auth_executor.shutdown(wait=True, cancel_futures=False)
         self.store.close()
@@ -2706,6 +2762,12 @@ def main():
                         help="on-air station callsign (AX.25 allows 1–6 characters plus optional -SSID)")
     parser.add_argument("--nick", help="display nickname; defaults to callsign")
     parser.add_argument("--channel", help="initial channel (defaults to last used, then #general)")
+    parser.add_argument("--dorcbot-url", default=os.getenv("KISSCHAT_DORCBOT_URL", ""),
+                        help="DORCbot bridge base URL; enables @dorcbot forwarding")
+    parser.add_argument("--dorcbot-token", default=os.getenv("KISSCHAT_DORCBOT_TOKEN", ""),
+                        help="shared bearer token for the DORCbot bridge")
+    parser.add_argument("--dorcbot-mention", default=os.getenv("KISSCHAT_DORCBOT_MENTION", "dorcbot"),
+                        help="mention alias that forwards to DORCbot (default dorcbot)")
     parser.add_argument("--mode", default="",
                         help="Data2G broadcast mode; in unattended mode this is used for explicit operator sends")
     parser.add_argument("--unattended", action="store_true",
@@ -2769,6 +2831,8 @@ def main():
                         help="disable periodic history exchange")
     parser.set_defaults(auto_sync=True)
     args = parser.parse_args()
+    if bool(args.dorcbot_url) != bool(args.dorcbot_token):
+        parser.error("--dorcbot-url and --dorcbot-token must be configured together")
     if args.sync_history_hours is not None and not 1 <= args.sync_history_hours <= MAX_SYNC_HISTORY_HOURS:
         parser.error(f"--sync-history-hours must be between 1 and {MAX_SYNC_HISTORY_HOURS}")
     if args.sync_history_messages is not None and not 0 <= args.sync_history_messages <= 1_000_000:

@@ -731,6 +731,28 @@ For an always-on history relay on a Docker host, run the headless profile:
 DATA2G_HOST=192.0.2.10 CALLSIGN=N0CALL docker compose --profile relay up -d kisschat-relay
 ```
 
+### Forward `@dorcbot` mentions to Discord
+
+KISSChat can send received messages containing `@dorcbot` to DORCbot. Configure
+the DORCbot bridge base URL and shared token on every station that should
+forward messages:
+
+```sh
+KISSCHAT_DORCBOT_URL=http://DORCBOT_HOST:8765 \
+KISSCHAT_DORCBOT_TOKEN=your-shared-secret \
+DATA2G_HOST=192.0.2.10 CALLSIGN=N0CALL \
+  docker compose --profile relay up -d kisschat-relay
+```
+
+Use the same `KISSCHAT_DORCBOT_TOKEN` as `KISSCHAT_BRIDGE_TOKEN` in DORCbot's
+environment. The bridge matches `#channel` to a Discord text channel with the
+same channel name; it posts only when there is one unambiguous match. The
+message's stable origin and sequence identify duplicates received through
+multiple stations. KISSChat records a mention receipt after DORCbot confirms
+the Discord post and retries temporary failures. Keep the bridge port
+reachable only from trusted KISSChat hosts. The bridge alias can be changed
+with `KISSCHAT_DORCBOT_MENTION` on KISSChat (default `dorcbot`).
+
 Run only one SUperChat instance against a given Data2G command service because
 Data2G gives that command interface to one client at a time. The relay profile
 restarts after host/container restarts and keeps the same message database.

@@ -69,6 +69,11 @@ class Store:
               delivered INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
               next_attempt INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY(origin,seq,recipient_id,mention));
+            CREATE TABLE IF NOT EXISTS dorcbot_delivery (
+              origin TEXT NOT NULL, seq INTEGER NOT NULL, mention TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0,
+              delivered INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY(origin,seq,mention));
             CREATE TABLE IF NOT EXISTS message_auth (
               origin TEXT NOT NULL, seq INTEGER NOT NULL, proof BLOB,
               status TEXT NOT NULL DEFAULT 'unsigned', signer TEXT NOT NULL DEFAULT '',
@@ -1117,6 +1122,36 @@ class Store:
             return [dict(row) for row in self.db.execute(
                 "SELECT origin AS o,seq AS s,nick AS n,body AS b FROM messages "
                 "WHERE instr(body,'@') > 0 ORDER BY origin,seq")]
+
+    def queue_dorcbot_delivery(self, origin: str, seq: int, mention: str) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT OR IGNORE INTO dorcbot_delivery(origin,seq,mention) VALUES(?,?,?)",
+                (origin, seq, mention))
+            self.db.commit()
+
+    def claim_dorcbot_deliveries(self, now: int, limit: int = 10) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT d.origin AS o,d.seq AS s,d.mention,m.channel AS c,m.nick AS n,"
+                "m.ts,m.body AS b,d.attempts FROM dorcbot_delivery d JOIN messages m "
+                "USING(origin,seq) WHERE d.delivered=0 AND d.next_attempt<=? "
+                "ORDER BY m.ts LIMIT ?", (now, limit)).fetchall()
+            for row in rows:
+                delay = min(3600, 30 * (2 ** min(int(row["attempts"]), 7)))
+                self.db.execute(
+                    "UPDATE dorcbot_delivery SET attempts=attempts+1,next_attempt=? "
+                    "WHERE origin=? AND seq=? AND mention=?",
+                    (now + delay, row["o"], row["s"], row["mention"]))
+            self.db.commit()
+            return [dict(row) for row in rows]
+
+    def finish_dorcbot_delivery(self, origin: str, seq: int, mention: str) -> None:
+        with self.lock:
+            self.db.execute(
+                "UPDATE dorcbot_delivery SET delivered=1 WHERE origin=? AND seq=? AND mention=?",
+                (origin, seq, mention))
+            self.db.commit()
 
     def recent_attachments(self, channel: str, limit: int = 12, *,
                            kind: str | None = None) -> list[dict]:
