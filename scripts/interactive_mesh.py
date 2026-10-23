@@ -129,13 +129,15 @@ def main() -> None:
     parser.add_argument("--interframe", type=float, default=0.25)
     parser.add_argument("--framing-bytes", type=int, default=24)
     parser.add_argument("--contention-window", type=float, default=0.5)
+    parser.add_argument("--channel-busy-delay", type=float, default=0.0,
+                        help="keep the simulated channel busy after each transmission (seconds)")
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--topology", choices=("full", "line", "asymmetric"),
                         default="full")
     parser.add_argument("--base-port", type=int, default=18901)
     parser.add_argument("--debug-log", help="write mesh trace here and client traces beside it")
-    parser.add_argument("--terminal", choices=("auto", "gnome-terminal", "konsole", "xterm"),
+    parser.add_argument("--terminal", choices=("auto", "gnome-terminal", "konsole", "xterm", "tmux"),
                         default="auto", help="terminal emulator used for each client window")
     opts = parser.parse_args()
     if opts.debug_log:
@@ -144,20 +146,22 @@ def main() -> None:
         parser.error("loss must be 0..1 and burst-recovery must be in (0, 1]")
     if not 1 <= opts.base_port <= 65533:
         parser.error("base-port must leave room for three ports")
-    if not 0 < opts.time_scale <= 10 or opts.bitrate <= 0:
-        parser.error("time-scale must be in (0, 10] and bitrate positive")
+    if (not 0 < opts.time_scale <= 10 or opts.bitrate <= 0 or
+            opts.channel_busy_delay < 0):
+        parser.error("time-scale must be in (0, 10], bitrate positive, and channel-busy-delay nonnegative")
     candidates = ([opts.terminal] if opts.terminal != "auto" else
                   ["gnome-terminal", "konsole", "xterm"])
     terminal = next((candidate for candidate in candidates
                      if subprocess.run(["sh", "-c", f"command -v {candidate}"],
                                        capture_output=True).returncode == 0), None)
     if not terminal:
-        parser.error("no supported terminal emulator found (gnome-terminal, konsole, xterm)")
+        parser.error("no supported terminal emulator found (gnome-terminal, konsole, xterm, tmux)")
 
     mesh = Mesh(loss=opts.loss, bitrate=opts.bitrate,
                 propagation=opts.propagation, interframe=opts.interframe,
                 framing_bytes=opts.framing_bytes,
-                contention_window=opts.contention_window, time_scale=opts.time_scale,
+                contention_window=opts.contention_window,
+                channel_busy_delay=opts.channel_busy_delay, time_scale=opts.time_scale,
                 seed=opts.seed, topology=opts.topology, loss_model=opts.loss_model,
                 burst_recovery=opts.burst_recovery, transport="ax25",
                 drop_first_history_fragment=False,
@@ -165,6 +169,7 @@ def main() -> None:
                 drop_first_proof_fragment=False, debug_log=opts.debug_log,
                 trace_sync=bool(opts.debug_log))
     stop_reason = "unexpected exit"
+    tmux_session = f"kisschat-mesh-{os.getpid()}" if opts.terminal == "tmux" else None
 
     def stop_on_term(signum, _frame):
         raise KeyboardInterrupt(f"received {signal.Signals(signum).name}")
@@ -223,7 +228,17 @@ def main() -> None:
                 commands[name] = args
             for name in STATIONS:
                 cmd = commands[name]
-                if terminal == "gnome-terminal":
+                if terminal == "tmux":
+                    client_runner = [sys.executable, str(Path(__file__).with_name(
+                        "run_interactive_client.py")), str(pid_paths[name]), *cmd]
+                    if name == STATIONS[0]:
+                        launch = ["tmux", "new-session", "-d", "-s", tmux_session,
+                                  "-n", "mesh", shlex.join(client_runner)]
+                    else:
+                        split = "-h" if name == STATIONS[1] else "-v"
+                        launch = ["tmux", "split-window", split, "-t",
+                                  f"{tmux_session}:mesh", shlex.join(client_runner)]
+                elif terminal == "gnome-terminal":
                     launch = [terminal, "--title", f"SUperChat {name}", "--",
                               sys.executable, str(Path(__file__).with_name(
                                   "run_interactive_client.py")), str(pid_paths[name]), *cmd]
@@ -236,10 +251,20 @@ def main() -> None:
                     launch = [terminal, "-T", f"SUperChat {name}", "-e", sys.executable,
                               str(Path(__file__).with_name("run_interactive_client.py")),
                               str(pid_paths[name]), *cmd]
-                clients.append(subprocess.Popen(launch, env=env, cwd=repo))
-            print(f"3 client windows launched; topology={opts.topology}, loss={opts.loss:.0%} "
+                if terminal == "tmux":
+                    subprocess.run(launch, env=env, cwd=repo, check=True)
+                    subprocess.run(["tmux", "select-pane", "-t",
+                                    f"{tmux_session}:mesh.{STATIONS.index(name)}",
+                                    "-T", name], check=True)
+                else:
+                    clients.append(subprocess.Popen(launch, env=env, cwd=repo))
+            print(f"3 client panes launched; topology={opts.topology}, loss={opts.loss:.0%} "
                   f"({opts.loss_model}), seed={opts.seed}")
-            print("Close the client windows or press Ctrl-C here to stop the mesh.")
+            if tmux_session:
+                subprocess.run(["tmux", "select-layout", "-t", f"{tmux_session}:mesh",
+                                "tiled"], check=True)
+                print(f"Attach to the three client panes with: tmux attach -t {tmux_session}")
+            print("Close the client panes or press Ctrl-C here to stop the mesh.")
             while True:
                 time.sleep(0.5)
         except KeyboardInterrupt as exc:
@@ -259,6 +284,9 @@ def main() -> None:
                 listener.close()
             for client in clients:
                 client.terminate()
+            if tmux_session:
+                subprocess.run(["tmux", "kill-session", "-t", tmux_session],
+                               check=False, capture_output=True)
             for radio in radios.values():
                 radio.close()
             mesh.log("[bridge] stopped")

@@ -5,9 +5,10 @@ import re
 
 MAGIC = b"KC2"
 MAX_FRAME = 220
-MIN_CHUNK_BYTES = 120
 MAX_MESSAGE_BYTES = 4096
+MIN_CHUNK_BYTES = 92
 MAX_PARTS = (MAX_MESSAGE_BYTES + MIN_CHUNK_BYTES - 1) // MIN_CHUNK_BYTES
+MAX_SPARSE_SEQUENCE_REQUESTS = (MAX_FRAME - 75) // 4
 PROOF_CHUNK_BYTES = 190
 MAX_PROOF_BYTES = PROOF_CHUNK_BYTES * 255
 IMAGE_CHUNK_BYTES = 139
@@ -168,9 +169,12 @@ def _decode_map(data: bytes, offset: int = 0, depth: int = 0) -> tuple[dict, int
     return result, offset
 
 
-def _message_chunk_limit(channel_bytes: int, nick_bytes: int, *, relay: bool = False) -> int:
-    # KC2D has a 48-byte fixed header; addressed KC2R records add one TTL byte.
-    return MAX_FRAME - 48 - channel_bytes - nick_bytes - int(relay)
+def _message_chunk_limit(channel_bytes: int, nick_bytes: int, *, relay: bool = False,
+                         sender: bool = False) -> int:
+    # KC2D has a 48-byte fixed header; addressed records add a TTL byte and
+    # sender-tagged addressed records add a node ID (direct records reuse dest).
+    return (MAX_FRAME - 48 - channel_bytes - nick_bytes - int(relay) -
+            (16 if sender else 0))
 
 
 def pack(record: dict) -> bytes:
@@ -192,6 +196,36 @@ def pack(record: dict) -> bytes:
                              for origin, low, high in entries))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid history summary") from exc
+    if record.get("t") == "q" and "r" in record and "h" not in record:
+        try:
+            destination = bytes.fromhex(record["to"])
+            requester = bytes.fromhex(record["from"])
+            origin = bytes.fromhex(record["o"])
+            values = [int(record.get(key, default)) for key, default in
+                      (("a", 0), ("b", 0), ("d", 0), ("f", 0), ("u", 0))]
+            ttl = int(record.get("ttl", 0))
+            attempt = int(record.get("k", 0))
+            sequences = record["r"]
+            if (any(len(value) != 16 for value in (destination, requester, origin)) or
+                    any(not 0 <= value <= 0xFFFFFFFF for value in values) or
+                    not 0 <= ttl <= 255 or not 0 <= attempt <= 31 or
+                    not isinstance(sequences, list) or not sequences or
+                    len(sequences) > MAX_SPARSE_SEQUENCE_REQUESTS or
+                    any(type(seq) is not int or not values[0] < seq <= values[1]
+                        for seq in sequences) or
+                    any(left >= right for left, right in zip(sequences, sequences[1:]))):
+                raise ValueError("invalid sparse history request")
+            flags = (int(bool(record.get("x"))) | (attempt << 1) |
+                     (int(bool(record.get("j"))) << 6))
+            wire = (MAGIC + b"S" + destination + requester + origin +
+                    b"".join(value.to_bytes(4, "big") for value in values) +
+                    bytes((flags, ttl, len(sequences))) +
+                    b"".join(seq.to_bytes(4, "big") for seq in sequences))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid sparse history request") from exc
+        if len(wire) > MAX_FRAME:
+            raise ValueError(f"chat frame is too large ({len(wire)} > {MAX_FRAME} bytes)")
+        return wire
     if record.get("t") == "q" and "h" in record:
         try:
             destination = bytes.fromhex(record["to"])
@@ -274,11 +308,12 @@ def pack(record: dict) -> bytes:
                      (int(bool(record.get("v"))) << 1) |
                      (int(bool(record.get("j"))) << 2) |
                      (attempt << 3))
+            page_limit = MAX_SPARSE_SEQUENCE_REQUESTS if record.get("j") else 8
             if (any(len(value) != 16 for value in identifiers) or
                     any(not 0 <= value <= 0xFFFFFFFF for value in values) or
                     not 0 <= ttl <= 255 or not 0 <= attempt <= 31 or
                     not isinstance(sequences, list) or
-                    len(sequences) > 8 or
+                    len(sequences) > page_limit or
                     any(type(seq) is not int or not 0 <= seq <= 0xFFFFFFFF
                         for seq in sequences)):
                 raise ValueError("invalid page-end record")
@@ -349,6 +384,28 @@ def unpack(wire: bytes) -> dict | None:
                     "d": values[2], "f": values[3], "u": values[4],
                     "x": bool(flags & 1), "k": flags >> 1, "ttl": ttl,
                     "r": [item[0] for item in fragments], "h": fragments}
+        if wire[3:4] == b"S":
+            if len(wire) < 76:
+                return None
+            destination = wire[4:20].hex()
+            requester = wire[20:36].hex()
+            origin = wire[36:52].hex()
+            values = [int.from_bytes(wire[52 + index * 4:56 + index * 4], "big")
+                      for index in range(5)]
+            flags, ttl, count = wire[72], wire[73], wire[74]
+            if (flags & ~0x7F or not 1 <= count <= MAX_SPARSE_SEQUENCE_REQUESTS or
+                    len(wire) != 75 + count * 4):
+                return None
+            sequences = [int.from_bytes(wire[offset:offset + 4], "big")
+                         for offset in range(75, len(wire), 4)]
+            if (any(not values[0] < seq <= values[1] for seq in sequences) or
+                    any(left >= right for left, right in zip(sequences, sequences[1:]))):
+                return None
+            return {"t": "q", "to": destination, "from": requester,
+                    "o": origin, "a": values[0], "b": values[1],
+                    "d": values[2], "f": values[3], "u": values[4],
+                    "x": bool(flags & 1), "k": (flags >> 1) & 0x1F,
+                    "j": bool(flags & 0x40), "ttl": ttl, "r": sequences}
         if wire[3:4] == b"r":
             if len(wire) < 62:
                 return None
@@ -390,7 +447,8 @@ def unpack(wire: bytes) -> dict | None:
             if len(wire) < 75:
                 return None
             flags, ttl, count = wire[72], wire[73], wire[74]
-            if count > 8 or len(wire) != 75 + count * 4:
+            page_limit = MAX_SPARSE_SEQUENCE_REQUESTS if flags & 4 else 8
+            if count > page_limit or len(wire) != 75 + count * 4:
                 return None
             offset = 4
             to = wire[offset:offset + 16].hex()
@@ -441,24 +499,35 @@ def unpack(wire: bytes) -> dict | None:
                         "i": index, "z": count, "ttl": ttl,
                         "b": wire[start + 22:]}
             return None
-        relay = wire[3:4] == b"R"
-        if (wire[3:4] != b"D" and not relay) or len(wire) < (49 if relay else 48):
+        tag = wire[3:4]
+        relay = tag in {b"R", b"V"}
+        sender_tagged = tag in {b"d", b"V"}
+        if tag not in {b"D", b"R", b"d", b"V"}:
+            return None
+        sender_extra = sender_tagged and relay
+        minimum = 48 + int(relay) + (16 if sender_extra else 0)
+        if len(wire) < minimum:
             return None
         try:
             offset = 1 if relay else 0
             ttl = wire[4] if relay else 0
             start = 4 + offset
             dest = wire[start:start + 16]
-            origin = wire[start + 16:start + 32]
-            seq = int.from_bytes(wire[start + 32:start + 36], "big")
-            timestamp = int.from_bytes(wire[start + 36:start + 40], "big")
-            channel_len, nick_len, index, count = wire[start + 40:start + 44]
+            sender_start = start + 16
+            sender_id = (wire[sender_start:sender_start + 16] if sender_extra else
+                         dest if sender_tagged else b"")
+            origin_start = sender_start + (16 if sender_extra else 0)
+            origin = wire[origin_start:origin_start + 16]
+            seq = int.from_bytes(wire[origin_start + 16:origin_start + 20], "big")
+            timestamp = int.from_bytes(wire[origin_start + 20:origin_start + 24], "big")
+            channel_len, nick_len, index, count = wire[origin_start + 24:origin_start + 28]
             adaptive = bool(count & 0x80)
             count &= 0x7F
-            end = start + 44 + channel_len + nick_len
-            channel = wire[start + 44:start + 44 + channel_len].decode("utf-8")
-            nick = wire[start + 44 + channel_len:end].decode("utf-8")
-            max_chunk = (_message_chunk_limit(channel_len, nick_len, relay=relay)
+            end = origin_start + 28 + channel_len + nick_len
+            channel = wire[origin_start + 28:origin_start + 28 + channel_len].decode("utf-8")
+            nick = wire[origin_start + 28 + channel_len:end].decode("utf-8")
+            max_chunk = (_message_chunk_limit(channel_len, nick_len, relay=relay,
+                                              sender=sender_extra)
                          if adaptive else MIN_CHUNK_BYTES)
             chunk = wire[end:]
             if (channel_len > 32 or nick_len > 16 or count == 0 or index >= count or
@@ -467,27 +536,33 @@ def unpack(wire: bytes) -> dict | None:
                     len(chunk) > max_chunk or
                     (index < count - 1 and len(chunk) != max_chunk)):
                 return None
-            return {"t": "d", "to": dest.hex() if any(dest) else "",
-                    "o": origin.hex(), "s": seq, "ts": timestamp,
-                    "i": index, "z": count, "c": channel, "n": nick,
-                    "b": chunk, "ttl": ttl, "chunk": max_chunk,
-                    "adaptive": adaptive}
+            record = {"t": "d", "to": dest.hex() if relay and any(dest) else "",
+                      "o": origin.hex(), "s": seq, "ts": timestamp,
+                      "i": index, "z": count, "c": channel, "n": nick,
+                      "b": chunk, "ttl": ttl, "chunk": max_chunk,
+                      "adaptive": adaptive}
+            if sender_tagged:
+                record["from"] = sender_id.hex()
+            return record
         except (IndexError, UnicodeDecodeError):
             return None
     return None
 
 
 def message_parts(*, origin: str, seq: int, channel: str, nick: str,
-                  timestamp: int, text: str, to: str = "", ttl: int = 4) -> list[bytes]:
+                  timestamp: int, text: str, to: str = "", ttl: int = 4,
+                  sender: str | None = None) -> list[bytes]:
     body = text.encode("utf-8")
     if len(body) > MAX_MESSAGE_BYTES:
         raise ValueError(f"message exceeds {MAX_MESSAGE_BYTES} UTF-8 bytes")
     try:
         origin_bytes = bytes.fromhex(origin)
         dest_bytes = bytes.fromhex(to) if to else bytes(16)
+        sender_bytes = bytes.fromhex(sender) if sender is not None else b""
     except ValueError as exc:
         raise ValueError("station IDs must be 32 hexadecimal characters") from exc
-    if len(origin_bytes) != 16 or len(dest_bytes) != 16:
+    if (len(origin_bytes) != 16 or len(dest_bytes) != 16 or
+            (sender is not None and len(sender_bytes) != 16)):
         raise ValueError("station IDs must be 128-bit values")
     if not 0 <= ttl <= 255:
         raise ValueError("relay limit is outside the wire range")
@@ -501,7 +576,10 @@ def message_parts(*, origin: str, seq: int, channel: str, nick: str,
     if not 1 <= seq <= 0xFFFFFFFF or not 0 <= timestamp <= 0xFFFFFFFF:
         raise ValueError("sequence or timestamp is outside the wire range")
     relay = bool(to)
-    chunk_limit = _message_chunk_limit(len(channel_bytes), len(nick_bytes), relay=relay)
+    source_tagged = sender is not None
+    sender_extra = source_tagged and relay
+    chunk_limit = _message_chunk_limit(len(channel_bytes), len(nick_bytes),
+                                      relay=relay, sender=sender_extra)
     if chunk_limit < MIN_CHUNK_BYTES:
         raise ValueError("channel and nick leave too little room in a radio frame")
     chunks = [body[i:i + chunk_limit] for i in range(0, len(body), chunk_limit)] or [b""]
@@ -510,24 +588,32 @@ def message_parts(*, origin: str, seq: int, channel: str, nick: str,
     encoded = []
     for index, chunk in enumerate(chunks):
         count = len(chunks) | 0x80
-        encoded.append(MAGIC + (b"R" if relay else b"D") +
-                       (bytes((ttl,)) if relay else b"") + dest_bytes + origin_bytes +
+        tag = ((b"V" if relay else b"d") if source_tagged else
+               (b"R" if relay else b"D"))
+        encoded.append(MAGIC + tag + (bytes((ttl,)) if relay else b"") +
+                       (dest_bytes if relay or not source_tagged else sender_bytes) +
+                       (sender_bytes if sender_extra else b"") + origin_bytes +
                        seq.to_bytes(4, "big") + timestamp.to_bytes(4, "big") +
                        bytes((len(channel_bytes), len(nick_bytes), index, count)) +
                        channel_bytes + nick_bytes + chunk)
     return encoded
 
 
-def relay_message_part(part: dict, ttl: int) -> bytes:
+def relay_message_part(part: dict, ttl: int, *, sender: str | None = None) -> bytes:
     """Re-encode one addressed history fragment without changing its contents."""
     recipient, origin = bytes.fromhex(part["to"]), bytes.fromhex(part["o"])
-    if len(recipient) != 16 or len(origin) != 16 or not 0 <= ttl <= 255:
+    sender_bytes = bytes.fromhex(sender) if sender is not None else b""
+    if (len(recipient) != 16 or len(origin) != 16 or
+            (sender is not None and len(sender_bytes) != 16) or
+            not 0 <= ttl <= 255):
         raise ValueError("invalid addressed history fragment")
     seq, timestamp = int(part["s"]), int(part["ts"])
     channel, nick = part["c"].encode("utf-8"), part["n"].encode("utf-8")
     index, count, body = int(part["i"]), int(part["z"]), part["b"]
     adaptive = bool(part.get("adaptive", False))
-    chunk_limit = (_message_chunk_limit(len(channel), len(nick), relay=True)
+    source_tagged = sender is not None
+    chunk_limit = (_message_chunk_limit(len(channel), len(nick), relay=True,
+                                        sender=source_tagged)
                    if adaptive else MIN_CHUNK_BYTES)
     if (not 1 <= seq <= 0xFFFFFFFF or not 0 <= timestamp <= 0xFFFFFFFF or
             not CHANNEL_NAME.fullmatch(part["c"]) or not 1 <= len(nick) <= 16 or
@@ -536,7 +622,8 @@ def relay_message_part(part: dict, ttl: int) -> bytes:
             len(body) > chunk_limit or (index < count - 1 and len(body) != chunk_limit)):
         raise ValueError("invalid addressed history fragment")
     wire_count = count | 0x80 if adaptive else count
-    frame = (MAGIC + b"R" + bytes((ttl,)) + recipient + origin +
+    frame = (MAGIC + (b"V" if source_tagged else b"R") + bytes((ttl,)) +
+             recipient + sender_bytes + origin +
              seq.to_bytes(4, "big") + timestamp.to_bytes(4, "big") +
              bytes((len(channel), len(nick), index, wire_count)) + channel + nick + body)
     if len(frame) > MAX_FRAME:

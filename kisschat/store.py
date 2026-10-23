@@ -72,8 +72,11 @@ class Store:
             CREATE TABLE IF NOT EXISTS message_auth (
               origin TEXT NOT NULL, seq INTEGER NOT NULL, proof BLOB,
               status TEXT NOT NULL DEFAULT 'unsigned', signer TEXT NOT NULL DEFAULT '',
-              detail TEXT NOT NULL DEFAULT '',
+              detail TEXT NOT NULL DEFAULT '', reference TEXT NOT NULL DEFAULT '',
               PRIMARY KEY(origin,seq));
+            CREATE TABLE IF NOT EXISTS station_auth (
+              callsign TEXT PRIMARY KEY, verified_at INTEGER NOT NULL,
+              expires_at INTEGER);
             CREATE TABLE IF NOT EXISTS proof_fragments (
               origin TEXT NOT NULL, seq INTEGER NOT NULL, idx INTEGER NOT NULL,
               count INTEGER NOT NULL, proof BLOB NOT NULL,
@@ -81,6 +84,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS attachments (
               origin TEXT NOT NULL, seq INTEGER NOT NULL, digest TEXT NOT NULL,
               size INTEGER NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+              kind TEXT NOT NULL DEFAULT 'image', metadata TEXT NOT NULL DEFAULT '',
               PRIMARY KEY(origin,seq));
             CREATE TABLE IF NOT EXISTS attachment_blobs (
               digest TEXT PRIMARY KEY, body BLOB NOT NULL);
@@ -128,6 +132,11 @@ class Store:
 
     def _migrate_schema(self) -> None:
         """Migrate durable receipts and unread state without losing old rows."""
+        auth_columns = {row["name"] for row in self.db.execute(
+            "PRAGMA table_info(message_auth)").fetchall()}
+        if "reference" not in auth_columns:
+            self.db.execute("ALTER TABLE message_auth ADD COLUMN reference "
+                            "TEXT NOT NULL DEFAULT ''")
         schemas = {
             "mention_receipts": (
                 "CREATE TABLE mention_receipts_new (origin TEXT NOT NULL, seq INTEGER NOT NULL, "
@@ -160,6 +169,14 @@ class Store:
             if "chunk_size" not in fragment_columns:
                 self.db.execute("ALTER TABLE fragments ADD COLUMN chunk_size "
                                 "INTEGER NOT NULL DEFAULT 120")
+            attachment_columns = {row["name"] for row in
+                                  self.db.execute("PRAGMA table_info(attachments)")}
+            if "kind" not in attachment_columns:
+                self.db.execute("ALTER TABLE attachments ADD COLUMN kind "
+                                "TEXT NOT NULL DEFAULT 'image'")
+            if "metadata" not in attachment_columns:
+                self.db.execute("ALTER TABLE attachments ADD COLUMN metadata "
+                                "TEXT NOT NULL DEFAULT ''")
             for table, (create_sql, copy_sql) in schemas.items():
                 info = self.db.execute(f"PRAGMA table_info({table})").fetchall()
                 primary_key = [row["name"] for row in sorted(info, key=lambda row: row["pk"])
@@ -231,8 +248,9 @@ class Store:
 
     def insert_local(self, channel: str, nick: str, timestamp: int, body: str,
                      image: tuple[bytes, int, int] | None = None,
-                     signer: str = "") -> dict:
-        """Commit a local message and all its durable image data atomically."""
+                     signer: str = "",
+                     card_attachment: dict | None = None) -> dict:
+        """Commit a local message and any deferred image/card payload atomically."""
         if (not CHANNEL_NAME.fullmatch(channel) or not nick or
                 len(nick.encode("utf-8")) > 16 or
                 not all(char.isprintable() for char in nick) or
@@ -241,6 +259,8 @@ class Store:
                 not all(char.isprintable() or char in "\t\n" for char in body)):
             raise ValueError("invalid local message")
         attachment = None
+        if image is not None and card_attachment is not None:
+            raise ValueError("a message may have one image or card attachment")
         if image is not None:
             if not isinstance(image, tuple) or len(image) != 3:
                 raise ValueError("invalid local thumbnail")
@@ -253,9 +273,29 @@ class Store:
                 raise ValueError("invalid local thumbnail")
             digest = hashlib.sha256(image_body).hexdigest()
             attachment = {"digest": digest, "size": len(image_body),
-                          "width": width, "height": height}
+                          "width": width, "height": height,
+                          "kind": "image", "metadata": ""}
+        elif card_attachment is not None:
+            if not isinstance(card_attachment, dict):
+                raise ValueError("invalid local card attachment")
+            card_body = card_attachment.get("payload")
+            width, height = card_attachment.get("width"), card_attachment.get("height")
+            digest, metadata = (card_attachment.get("digest"),
+                                card_attachment.get("metadata"))
+            if (not isinstance(card_body, bytes) or
+                    not 0 < len(card_body) <= MAX_CACHED_THUMBNAIL_BYTES or
+                    type(width) is not int or not 1 <= width <= MAX_EDGE or
+                    type(height) is not int or not 1 <= height <= MAX_EDGE or
+                    not isinstance(digest, str) or
+                    hashlib.sha256(card_body).hexdigest() != digest or
+                    not isinstance(metadata, str) or len(metadata.encode("utf-8")) > 4096 or
+                    metadata != body):
+                raise ValueError("invalid local card attachment")
+            attachment = {"digest": digest, "size": len(card_body),
+                          "width": width, "height": height,
+                          "kind": "card", "metadata": metadata}
         if not body and attachment is None:
-            raise ValueError("a local message needs text or an image")
+            raise ValueError("a local message needs text or an attachment")
 
         with self.lock:
             self.db.execute("BEGIN IMMEDIATE")
@@ -271,12 +311,16 @@ class Store:
                 message = {"o": self.node, "s": seq, "c": channel,
                            "n": nick, "ts": timestamp, "b": body}
                 if attachment is not None:
-                    self.db.execute("INSERT INTO attachments VALUES(?,?,?,?,?,?)",
+                    self.db.execute("INSERT INTO attachments "
+                                    "(origin,seq,digest,size,width,height,kind,metadata) "
+                                    "VALUES(?,?,?,?,?,?,?,?)",
                                     (self.node, seq, attachment["digest"],
                                      attachment["size"], attachment["width"],
-                                     attachment["height"]))
-                    self._cache_image_locked(attachment["digest"], image[0])
-                    message["image"] = attachment
+                                     attachment["height"], attachment["kind"],
+                                     attachment["metadata"]))
+                    blob = image[0] if image is not None else card_attachment["payload"]
+                    self._cache_image_locked(attachment["digest"], blob)
+                    message["image" if attachment["kind"] == "image" else "attachment"] = attachment
                 if signer:
                     self.db.execute(
                         "INSERT INTO message_auth(origin,seq,proof,status,signer,detail) "
@@ -300,7 +344,8 @@ class Store:
         chunk_size = int(part.get("chunk", MIN_CHUNK_BYTES))
         expected_chunk_size = (_message_chunk_limit(len(channel.encode("utf-8")),
                                                      len(nick.encode("utf-8")),
-                                                     relay=relay)
+                                                     relay=relay,
+                                                     sender=relay and bool(part.get("from")))
                                if adaptive else MIN_CHUNK_BYTES)
         if (len(origin) != 32 or not 1 <= seq <= 0xFFFFFFFF or
                 not 1 <= count <= MAX_PARTS or not 0 <= index < count or
@@ -403,6 +448,9 @@ class Store:
                 return "relayed"
             if not row["known"]:
                 return "unknown"
+            if re.fullmatch(r"[0-9a-fA-F]{32}", row["source"]):
+                return ("direct" if row["source"].casefold() == origin.casefold()
+                        else "relayed")
             if row["callsign"]:
                 return "direct" if row["source"] == row["callsign"] else "relayed"
             other = self.db.execute(
@@ -427,6 +475,41 @@ class Store:
             return self.db.execute(
                 "SELECT 1 FROM messages WHERE origin=? AND seq=?", (origin, seq)
             ).fetchone() is not None
+
+    def record_station_auth(self, callsign: str, verified_at: int,
+                            expires_at: int | None = None) -> None:
+        if not callsign or (expires_at is not None and expires_at <= verified_at):
+            raise ValueError("invalid station authentication period")
+        with self.lock:
+            self.db.execute("INSERT INTO station_auth(callsign,verified_at,expires_at) "
+                            "VALUES(?,?,?) ON CONFLICT(callsign) DO UPDATE SET "
+                            "verified_at=excluded.verified_at,expires_at=excluded.expires_at",
+                            (callsign.upper(), int(verified_at), int(expires_at)))
+            self.db.commit()
+
+    def authenticated_stations(self, now: int | None = None) -> dict[str, dict[str, int]]:
+        now = int(time.time()) if now is None else int(now)
+        with self.lock:
+            self.db.execute("DELETE FROM station_auth WHERE expires_at IS NOT NULL "
+                            "AND expires_at<=?", (now,))
+            rows = self.db.execute(
+                "SELECT callsign,verified_at,expires_at FROM station_auth "
+                "WHERE expires_at IS NULL OR expires_at>? ORDER BY callsign", (now,)).fetchall()
+            self.db.commit()
+        return {row["callsign"]: {"verified_at": int(row["verified_at"]),
+                                   "expires_at": (int(row["expires_at"])
+                                                  if row["expires_at"] is not None else 0)}
+                for row in rows}
+
+    def clear_station_auth(self, callsign: str | None = None) -> int:
+        with self.lock:
+            if callsign:
+                cursor = self.db.execute("DELETE FROM station_auth WHERE callsign=?",
+                                         (callsign.upper(),))
+            else:
+                cursor = self.db.execute("DELETE FROM station_auth")
+            self.db.commit()
+            return cursor.rowcount
 
     def missing_fragment_mask(self, origin: str, seq: int) -> int:
         """Return a bitmask of absent message fragments, or zero if none are cached."""
@@ -505,6 +588,54 @@ class Store:
                             (origin, high))
             self.db.commit()
             return high
+
+    def missing_sequence_count(self, origin: str, after: int, through: int) -> int:
+        """Count absent complete messages in one inclusive sequence window."""
+        if through <= after:
+            return 0
+        with self.lock:
+            present = int(self.db.execute(
+                "SELECT COUNT(*) FROM messages WHERE origin=? AND seq>? AND seq<=?",
+                (origin, after, through)).fetchone()[0])
+            return max(0, through - after - present)
+
+    def missing_sequences(self, origin: str, after: int, through: int,
+                          *, limit: int) -> list[int]:
+        """Return the earliest absent sequences without expanding huge ranges."""
+        if through <= after or limit <= 0:
+            return []
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT seq FROM messages WHERE origin=? AND seq>? AND seq<=? ORDER BY seq",
+                (origin, after, through)).fetchall()
+        missing = []
+        next_seq = after + 1
+        for row in rows:
+            present_seq = int(row["seq"])
+            while next_seq < present_seq and len(missing) < limit:
+                missing.append(next_seq)
+                next_seq += 1
+            if len(missing) >= limit:
+                return missing
+            next_seq = max(next_seq, present_seq + 1)
+        while next_seq <= through and len(missing) < limit:
+            missing.append(next_seq)
+            next_seq += 1
+        return missing
+
+    def sequence_at_missing_offset(self, origin: str, after: int, through: int,
+                                   offset: int) -> int | None:
+        """Find the Nth missing sequence without materializing earlier gaps."""
+        if offset <= 0 or offset > self.missing_sequence_count(origin, after, through):
+            return None
+        low, high = after + 1, through
+        while low < high:
+            middle = (low + high) // 2
+            if self.missing_sequence_count(origin, after, middle) >= offset:
+                high = middle
+            else:
+                low = middle + 1
+        return low
 
     def inventory(self, since: int) -> list[tuple[str, int, int]]:
         with self.lock:
@@ -601,6 +732,18 @@ class Store:
                             "detail=excluded.detail", (origin, seq, proof, status, signer, detail))
             self.db.commit()
 
+    def set_auth_reference(self, origin: str, seq: int, reference: str) -> None:
+        if not re.fullmatch(r"AR1[A-Z2-7]{16}", reference):
+            raise ValueError("invalid ARAP proof reference")
+        with self.lock:
+            self.db.execute("INSERT INTO message_auth(origin,seq,reference,status) "
+                            "VALUES(?,?,?,'pending') ON CONFLICT(origin,seq) DO UPDATE SET "
+                            "reference=excluded.reference,status=CASE "
+                            "WHEN message_auth.proof IS NULL THEN 'pending' "
+                            "ELSE message_auth.status END",
+                            (origin, seq, reference))
+            self.db.commit()
+
     def refresh_auth_policy(self, revision: str) -> int:
         """Invalidate cached proof decisions after local verification policy changes."""
         if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{64}", revision):
@@ -610,6 +753,7 @@ class Store:
                 return 0
             self.db.execute("BEGIN IMMEDIATE")
             try:
+                self.db.execute("DELETE FROM station_auth")
                 cursor = self.db.execute(
                     "UPDATE message_auth SET status='pending',"
                     "detail='ARAP verification policy changed; rechecking' "
@@ -625,7 +769,7 @@ class Store:
 
     def auth_for(self, origin: str, seq: int) -> dict:
         with self.lock:
-            row = self.db.execute("SELECT status,signer,detail,proof FROM message_auth "
+            row = self.db.execute("SELECT status,signer,detail,proof,reference FROM message_auth "
                                   "WHERE origin=? AND seq=?", (origin, seq)).fetchone()
             if row:
                 return dict(row)
@@ -688,7 +832,8 @@ class Store:
                     for row in rows]
 
     def set_attachment(self, origin: str, seq: int, digest: str, size: int,
-                       width: int, height: int) -> bool:
+                       width: int, height: int, *, kind: str = "image",
+                       metadata: str = "") -> bool:
         if (not isinstance(origin, str) or len(origin) != 32 or
                 any(char not in "0123456789abcdef" for char in origin) or
                 not isinstance(digest, str) or len(digest) != 64 or
@@ -696,22 +841,39 @@ class Store:
                 type(seq) is not int or not 1 <= seq <= 0xFFFFFFFF or
                 type(size) is not int or not 0 < size <= MAX_CACHED_THUMBNAIL_BYTES or
                 type(width) is not int or not 1 <= width <= MAX_EDGE or
-                type(height) is not int or not 1 <= height <= MAX_EDGE):
+                type(height) is not int or not 1 <= height <= MAX_EDGE or
+                not isinstance(kind, str) or kind not in {"image", "card"} or
+                not isinstance(metadata, str) or
+                len(metadata.encode("utf-8")) > 4096 or
+                (kind == "image" and metadata)):
             return False
         with self.lock:
             existing = self.db.execute(
-                "SELECT digest,size,width,height FROM attachments WHERE origin=? AND seq=?",
+                "SELECT digest,size,width,height,kind,metadata FROM attachments "
+                "WHERE origin=? AND seq=?",
                 (origin, seq)).fetchone()
             if existing:
-                return tuple(existing) == (digest, size, width, height)
-            self.db.execute("INSERT INTO attachments VALUES(?,?,?,?,?,?)",
-                            (origin, seq, digest, size, width, height))
+                if tuple(existing[:5]) != (digest, size, width, height, kind):
+                    return False
+                if existing["metadata"] == metadata or not metadata:
+                    return True
+                if not existing["metadata"]:
+                    self.db.execute("UPDATE attachments SET metadata=? WHERE origin=? AND seq=?",
+                                    (metadata, origin, seq))
+                    self.db.commit()
+                    return True
+                return False
+            self.db.execute(
+                "INSERT INTO attachments "
+                "(origin,seq,digest,size,width,height,kind,metadata) VALUES(?,?,?,?,?,?,?,?)",
+                (origin, seq, digest, size, width, height, kind, metadata))
             self.db.commit()
         return True
 
     def attachment_for(self, origin: str, seq: int) -> dict | None:
         with self.lock:
-            row = self.db.execute("SELECT origin,seq,digest,size,width,height FROM attachments "
+            row = self.db.execute("SELECT origin,seq,digest,size,width,height,kind,metadata "
+                                  "FROM attachments "
                                   "WHERE origin=? AND seq=?", (origin, seq)).fetchone()
             return dict(row) if row else None
 
@@ -720,7 +882,7 @@ class Store:
         """One bounded metadata advertisement, independent of message highwater."""
         with self.lock:
             query = ("SELECT a.* FROM attachments a JOIN messages m USING(origin,seq) "
-                     "WHERE m.ts>=? AND m.ts<=? ")
+                     "WHERE m.ts>=? AND m.ts<=? AND a.kind='image' ")
             params = [since, int(time.time())]
             if origin is not None:
                 query += "AND a.origin=? ORDER BY a.seq DESC LIMIT 1"
@@ -736,15 +898,21 @@ class Store:
         if not 1 <= len(prefix) <= 32 or any(ch not in "0123456789abcdef" for ch in prefix):
             return None
         with self.lock:
-            row = self.db.execute("SELECT origin,seq,digest,size,width,height FROM attachments "
+            row = self.db.execute("SELECT origin,seq,digest,size,width,height,kind,metadata "
+                                  "FROM attachments "
                                   "WHERE substr(origin,1,?)=? AND seq=? ORDER BY origin LIMIT 2",
                                   (len(prefix), prefix, seq)).fetchall()
             return dict(row[0]) if len(row) == 1 else None
 
     def put_image(self, digest: str, body: bytes) -> bool:
-        if (len(body) > MAX_CACHED_THUMBNAIL_BYTES or
+        return self.put_attachment_blob(digest, body, kind="image")
+
+    def put_attachment_blob(self, digest: str, body: bytes, *, kind: str) -> bool:
+        if (not isinstance(kind, str) or kind not in {"image", "card"} or
+                not isinstance(body, bytes) or
+                len(body) > MAX_CACHED_THUMBNAIL_BYTES or
                 hashlib.sha256(body).hexdigest() != digest or
-                not is_valid_thumbnail(body)):
+                (kind == "image" and not is_valid_thumbnail(body))):
             return False
         with self.lock:
             self._cache_image_locked(digest, body)
@@ -766,15 +934,25 @@ class Store:
             total -= int(oldest["size"])
 
     def image_for(self, digest: str) -> bytes | None:
+        """Read a cached attachment blob (legacy name retained for callers)."""
+        return self.attachment_blob_for(digest)
+
+    def attachment_blob_for(self, digest: str) -> bytes | None:
         with self.lock:
             row = self.db.execute("SELECT body FROM attachment_blobs WHERE digest=?", (digest,)).fetchone()
             return bytes(row[0]) if row else None
 
     def add_image_fragment(self, part: dict) -> bytes | None:
+        return self.add_attachment_fragment(part, kind="image")
+
+    def add_attachment_fragment(self, part: dict, *, kind: str,
+                                validator=None) -> bytes | None:
         origin, seq, digest = part["o"], int(part["s"]), part["h"]
         index, count, chunk = int(part["i"]), int(part["z"]), part["b"]
         attachment = self.attachment_for(origin, seq)
-        if (not attachment or attachment["digest"] != digest or count > 200 or
+        if (not attachment or attachment["kind"] != kind or
+                attachment["digest"] != digest or not 1 <= count <= 200 or
+                not 0 <= index < count or
                 not isinstance(chunk, bytes) or len(chunk) > 144):
             return None
         with self.lock:
@@ -795,9 +973,20 @@ class Store:
             body = b"".join(bytes(item["body"]) for item in rows)
             self.db.execute("DELETE FROM image_fragments WHERE origin=? AND seq=?", (origin, seq))
             self.db.commit()
-        # The digest protects the bytes; the advertised size also bounds the
-        # reassembled transfer to the exact thumbnail announced in history.
-        return body if len(body) == int(attachment["size"]) and self.put_image(digest, body) else None
+        # The digest and declared size protect any opaque attachment. Images
+        # retain their format check; other kinds supply a content validator.
+        if (len(body) != int(attachment["size"]) or
+                hashlib.sha256(body).hexdigest() != digest):
+            return None
+        if kind == "image" and not is_valid_thumbnail(body):
+            return None
+        if validator is not None:
+            try:
+                if not validator(body):
+                    return None
+            except (ValueError, TypeError, IndexError, KeyError):
+                return None
+        return body if self.put_attachment_blob(digest, body, kind=kind) else None
 
     def missing_image_indices(self, origin: str, seq: int, count: int) -> list[int]:
         """Return missing thumbnail chunks, resetting progress from older layouts."""
@@ -929,13 +1118,20 @@ class Store:
                 "SELECT origin AS o,seq AS s,nick AS n,body AS b FROM messages "
                 "WHERE instr(body,'@') > 0 ORDER BY origin,seq")]
 
-    def recent_attachments(self, channel: str, limit: int = 12) -> list[dict]:
+    def recent_attachments(self, channel: str, limit: int = 12, *,
+                           kind: str | None = None) -> list[dict]:
         with self.lock:
-            rows = self.db.execute(
-                "SELECT a.origin,a.seq,a.digest,a.size,a.width,a.height,m.nick,m.ts "
-                "FROM attachments AS a JOIN messages AS m USING(origin,seq) "
-                "WHERE m.channel=? ORDER BY m.ts DESC,a.origin DESC,a.seq DESC LIMIT ?",
-                (channel, limit)).fetchall()
+            query = ("SELECT a.origin,a.seq,a.digest,a.size,a.width,a.height,a.kind,a.metadata,"
+                     "m.nick,m.ts FROM attachments AS a "
+                     "JOIN messages AS m USING(origin,seq) WHERE m.channel=? ")
+            params: tuple = (channel,)
+            if kind is not None:
+                if kind not in {"image", "card"}:
+                    return []
+                query += "AND a.kind=? "
+                params += (kind,)
+            query += "ORDER BY m.ts DESC,a.origin DESC,a.seq DESC LIMIT ?"
+            rows = self.db.execute(query, (*params, limit)).fetchall()
             return [dict(row) for row in rows]
 
     def mark_receipt(self, origin: str, seq: int, recipient: str,

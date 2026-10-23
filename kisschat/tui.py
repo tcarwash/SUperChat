@@ -30,6 +30,12 @@ from textual.widgets.option_list import Option
 
 from .app import Chat
 from .images import render_thumbnail
+from .pixel_cards import (ANIMATION_MESSAGE_PREFIX, CARD_MESSAGE_PREFIX,
+                         CARD_REFERENCE_PREFIX, PixelCard, PixelCardAnimation,
+                         PixelCardReference, decode_pixel_card_message,
+                         decode_pixel_card_reference, list_pixel_cards,
+                         pixelqso_artwork_digest, render_pixel_card,
+                         verify_pixel_card_payload)
 from .mentions import (BARE_MENTION, MENTION, MENTION_RE, format_mention,
                        mention_name, valid_mention_name)
 
@@ -414,6 +420,98 @@ class ImagePicker(ModalScreen[dict | None]):
             self.dismiss(self.images[event.option_index])
 
 
+class PixelCardPicker(ModalScreen[PixelCard | None]):
+    BINDINGS = [("escape", "dismiss(None)", "Close")]
+    CSS = """
+    PixelCardPicker { align: center middle; background: $background 75%; }
+    #pixel-card-box { width: 1fr; max-width: 96; height: 1fr; max-height: 28; margin: 0 1; padding: 1 2; border: round $accent; background: #111827; }
+    #pixel-card-title { height: 1; color: #d8ccff; text-style: bold; margin-bottom: 1; }
+    #pixel-card-content { height: 1fr; }
+    #pixel-card-list-pane { width: 1fr; height: 1fr; }
+    #pixel-card-list { height: 1fr; border: none; background: #111827; }
+    #pixel-card-help { height: 1; color: #8a98ae; }
+    #pixel-card-preview { width: 34; min-width: 28; height: 1fr; margin-left: 1; padding: 1; border: round #374151; background: #0f172a; }
+    #pixel-card-content.-stacked { layout: vertical; }
+    #pixel-card-content.-stacked #pixel-card-list-pane { width: 1fr; height: 1fr; }
+    #pixel-card-content.-stacked #pixel-card-preview { width: 1fr; height: 15; min-height: 13; margin-left: 0; margin-top: 1; }
+    #pixel-card-empty { height: 1fr; color: #8a98ae; content-align: center middle; }
+    """
+
+    def __init__(self, cards: list[PixelCard]):
+        super().__init__()
+        self.cards = cards
+        self.previewed_index: int | None = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pixel-card-box"):
+            yield Label("SEND A PIXELQSO CARD", id="pixel-card-title")
+            if self.cards:
+                options = []
+                labels = {"my": "My card", "sent": "Sent card", "starter": "Starter card"}
+                for index, card in enumerate(self.cards):
+                    identity = " · ".join(value for value in (card.callsign, card.grid) if value)
+                    title = card.title
+                    frame = (f" · linked frame 2 → {card.animation_link['first_card_id']:04X} · "
+                             f"{card.animation_link['frame_ms']} ms"
+                             if card.animation_link else "")
+                    label = (f"{labels.get(card.category, 'PixelQSO card')} · {title} · "
+                             f"{identity or 'No station'} · {card.width}×{card.height} · "
+                             f"{len(card.palette)} colors{frame}")
+                    options.append(Option(label, id=f"pixel-card-{index}"))
+                with Horizontal(id="pixel-card-content"):
+                    with Vertical(id="pixel-card-list-pane"):
+                        yield OptionList(*options, id="pixel-card-list")
+                        yield Static("↑↓ preview · Enter sends · Esc closes", id="pixel-card-help")
+                    yield Static(self._preview_renderable(0), id="pixel-card-preview")
+            else:
+                yield Static("No PixelQSO cards found. Save a card in PixelQSO or set "
+                             "PIXELQSO_DATA_DIR to its data folder.", id="pixel-card-empty")
+
+    def on_mount(self) -> None:
+        if self.cards:
+            if self.size.width < 106:
+                self.query_one("#pixel-card-content", Horizontal).add_class("-stacked")
+            listing = self.query_one("#pixel-card-list", OptionList)
+            listing.focus()
+            if listing.highlighted is None:
+                listing.highlighted = 0
+            self._update_preview(listing.highlighted or 0)
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option_list.id == "pixel-card-list":
+            self._update_preview(event.option_index)
+
+    def _update_preview(self, index: int) -> None:
+        if 0 <= index < len(self.cards):
+            self.previewed_index = index
+            self.query_one("#pixel-card-preview", Static).update(
+                self._preview_renderable(index))
+
+    def _preview_renderable(self, index: int):
+        card = self.cards[index]
+        if isinstance(card, PixelCardAnimation):
+            title = f"{card.first.title} → {card.second.title}"
+            details = (f"Two frames · {card.frame_ms} ms/frame\n"
+                       f"{card.callsign} · {card.grid} · {card.width}×{card.height} · "
+                       f"{len(card.palette)} colors\nPreview: frame 1")
+            image = render_pixel_card(card.first, max_width=24, max_height=8)
+        else:
+            title = card.title
+            details = (f"{card.callsign} · {card.grid} · {card.width}×{card.height} · "
+                       f"{len(card.palette)} colors")
+            if card.animation_link:
+                details += (f"\nFrame 2 · links to {card.animation_link['first_card_id']:04X} · "
+                            f"{card.animation_link['frame_ms']} ms/frame")
+            image = render_pixel_card(card, max_width=24, max_height=8)
+        return Group(Text(title, style="bold #d8ccff"),
+                     Text(details, style="#9fb0c7"), image)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "pixel-card-list" and event.option_index < len(self.cards):
+            card = self.cards[event.option_index]
+            self.dismiss(card)
+
+
 class ChatApp(App[None]):
     TITLE = "SUperChat"
     CSS_PATH = "tui.tcss"
@@ -433,7 +531,7 @@ class ChatApp(App[None]):
         self.channel_drafts: dict[str, str] = {}
         self.unread: dict[str, int] = {}
         self.unread_mentions: dict[str, int] = {}
-        self.images: list[dict] = []
+        self.attachments: list[dict] = []
         self.history_limit = 200
         self.search_query: str | None = None
         self.displayed_messages: set[tuple[str, int]] = set()
@@ -441,6 +539,8 @@ class ChatApp(App[None]):
         self.new_message_times: dict[tuple[str, int], float] = {}
         self.message_line_offsets: dict[tuple[str, int], int] = {}
         self.message_render_cache: dict[tuple[str, int], object] = {}
+        self.pixel_card_animations: dict[tuple[str, int], PixelCardAnimation] = {}
+        self.pixel_card_frame_indices: dict[tuple[str, int], int] = {}
         self.message_render_search: str | None = None
         self.cleared_messages: set[tuple[str, int]] = set()
         self.last_status = "Broadcast link ready"
@@ -473,8 +573,11 @@ class ChatApp(App[None]):
                                     suggester=ChatSuggester(self._mention_targets,
                                                             self._connect_targets),
                                     max_length=4096, on_image_drop=self._open_dropped_image)
-                yield Button("＋ Image", id="attach-image", variant="default")
-                yield Static("＋ Image to browse or enter a path · Ctrl+Shift+K channels · /images",
+                with Horizontal(id="composer-actions"):
+                    yield Button("＋ Image", id="attach-image", variant="default")
+                    yield Button("＋ PixelQSO card", id="attach-card", variant="default")
+                yield Static("＋ Image thumbnails · ＋ PixelQSO cards · "
+                             "Ctrl+Shift+K channels · /images",
                              id="composer-hint")
             with Vertical(id="rail", classes="panel"):
                 yield Static("LINK STATUS", classes="eyebrow")
@@ -503,7 +606,7 @@ class ChatApp(App[None]):
                 yield Static(f"{self.chat.nick}\n{self.chat.args.callsign}", id="station-card")
                 yield Static("HEARD STATIONS", classes="eyebrow section-label")
                 yield Static("Listening for stations…", id="station-list")
-                yield Static("RECENT IMAGES", classes="eyebrow section-label")
+                yield Static("RECENT ATTACHMENTS", classes="eyebrow section-label")
                 yield OptionList(id="image-list")
                 yield Button("↓  Request selected", id="request-image", variant="default")
                 yield Static("MESH SYNC", classes="eyebrow section-label")
@@ -527,10 +630,11 @@ class ChatApp(App[None]):
         self._refresh_channels()
         self._load_messages()
         self.set_interval(0.15, self._drain_events)
+        self.set_interval(0.1, self._animate_pixel_card_messages)
         self.set_interval(1, self._fade_new_messages)
         self.query_one("#composer", Input).focus()
         self._refresh_stations()
-        self._refresh_images()
+        self._refresh_attachments()
         self._refresh_stats()
 
     def _channels(self) -> list[str]:
@@ -570,11 +674,14 @@ class ChatApp(App[None]):
             self.action_switch_channel()
         elif event.button.id == "attach-image":
             self.push_screen(ImageAttachScreen(), self._send_attached_image)
+        elif event.button.id == "attach-card":
+            self.push_screen(PixelCardPicker(list_pixel_cards()), self._send_attached_card)
         elif event.button.id == "request-image":
             listing = self.query_one("#image-list", OptionList)
-            if self.images and listing.highlighted is not None:
-                image = self.images[listing.highlighted]
-                self.chat.command(f"/image-get {image['origin']}:{image['seq']}")
+            if self.attachments and listing.highlighted is not None:
+                attachment = self.attachments[listing.highlighted]
+                self.chat.command(
+                    f"/image-get {attachment['origin']}:{attachment['seq']}")
         elif event.button.id == "load-older":
             self.history_limit += 200
             self._load_messages()
@@ -648,6 +755,11 @@ class ChatApp(App[None]):
         self.chat.queue_image(path, caption)
         self.query_one("#composer", Input).focus()
 
+    def _send_attached_card(self, card: PixelCard | None) -> None:
+        if card:
+            self.chat.queue_card(card)
+            self.query_one("#composer", Input).focus()
+
     def _open_dropped_image(self, path: str) -> bool:
         self.push_screen(ImageAttachScreen(path), self._send_attached_image)
         return True
@@ -675,7 +787,7 @@ class ChatApp(App[None]):
             "Shared radio channel  ·  CHAT group   ·   local and relayed history")
         self.query_one("#composer", Input).placeholder = f"Message {self.channel}"
         self._refresh_channels()
-        self._refresh_images()
+        self._refresh_attachments()
         self._load_messages()
         self.query_one("#composer", Input).focus()
 
@@ -693,7 +805,7 @@ class ChatApp(App[None]):
         self.cleared_messages.clear()
         self.history_limit = 200
         self._load_messages()
-        self._refresh_images()
+        self._refresh_attachments()
         self.query_one("#composer", Input).focus()
 
     def _switch_result(self, channel: str | None) -> None:
@@ -706,7 +818,7 @@ class ChatApp(App[None]):
             self.search_query = None
             self.history_limit = 200
             self._load_messages()
-            self._refresh_images()
+            self._refresh_attachments()
             self._refresh_channels()
             queued = self.chat.last_purge_queued_frames
             self.last_status = (f"Cleared {deleted} local messages and image data; "
@@ -732,7 +844,8 @@ class ChatApp(App[None]):
         if not content:
             return
         if content.casefold() == "/images":
-            self.push_screen(ImagePicker(self.chat.store.recent_attachments(self.channel),
+            self.push_screen(ImagePicker(self.chat.store.recent_attachments(
+                                             self.channel, kind="image"),
                                          self.chat.store), self._request_picked_image)
             return
         command_parts = content.split(maxsplit=1)
@@ -763,7 +876,7 @@ class ChatApp(App[None]):
                 self.history_limit = count
                 self.cleared_messages.clear()
                 self._load_messages()
-                self._refresh_images()
+                self._refresh_attachments()
             self._refresh_channels()
             self._refresh_stations()
         else:
@@ -806,6 +919,14 @@ class ChatApp(App[None]):
                                    for message in messages}
         self.message_render_cache = {key: value for key, value in self.message_render_cache.items()
                                      if key in self.displayed_messages}
+        self.pixel_card_animations = {
+            key: value for key, value in self.pixel_card_animations.items()
+            if key in self.displayed_messages
+        }
+        self.pixel_card_frame_indices = {
+            key: value for key, value in self.pixel_card_frame_indices.items()
+            if key in self.displayed_messages
+        }
         self.displayed_day = None
         for message in messages:
             day, marker = self._day_marker(int(message["ts"]))
@@ -847,6 +968,25 @@ class ChatApp(App[None]):
         self.new_message_times = {key: stamp for key, stamp in self.new_message_times.items()
                                   if now - stamp < MESSAGE_HIGHLIGHT_SECONDS}
         if visible:
+            self._load_messages(preserve_scroll=True)
+
+    def _card_animation_now_ms(self) -> float:
+        return time.monotonic() * 1000
+
+    def _animate_pixel_card_messages(self) -> None:
+        if not self.is_mounted or not self.pixel_card_animations:
+            return
+        now_ms = self._card_animation_now_ms()
+        changed = False
+        for identity, animation in self.pixel_card_animations.items():
+            if identity not in self.displayed_messages:
+                continue
+            frame_index = animation.frame_index(now_ms)
+            if self.pixel_card_frame_indices.get(identity) != frame_index:
+                self.pixel_card_frame_indices[identity] = frame_index
+                self.message_render_cache.pop(identity, None)
+                changed = True
+        if changed:
             self._load_messages(preserve_scroll=True)
 
     @staticmethod
@@ -966,6 +1106,34 @@ class ChatApp(App[None]):
             pieces.append(cls._render_inline_body(body))
         return pieces
 
+    def _linked_card_animation(self, second: PixelCard, message: dict
+                               ) -> PixelCardAnimation | None:
+        link = second.animation_link
+        if not link:
+            return None
+        for candidate in self.chat.store.history(message["c"], self.history_limit):
+            if (candidate["o"], int(candidate["s"])) == (message["o"], int(message["s"])):
+                continue
+            reference = decode_pixel_card_reference(str(candidate["b"]))
+            if (reference is None or reference.is_linked_frame or
+                    reference.card_id != link["first_card_id"] or
+                    reference.callsign.casefold() != second.callsign.casefold() or
+                    (reference.width, reference.height) != (second.width, second.height)):
+                continue
+            payload = self.chat.store.attachment_blob_for(reference.digest)
+            if payload is None:
+                continue
+            try:
+                first = verify_pixel_card_payload(payload, reference)
+                if (first.animation_link is not None or
+                        pixelqso_artwork_digest(first) != link["first_digest"]):
+                    continue
+            except ValueError:
+                continue
+            return PixelCardAnimation(second.title, first, second, link["frame_ms"],
+                                      link["first_digest"], category=second.category)
+        return None
+
     def _message_content(self, message: dict):
         stamp = time.strftime("%H:%M", time.localtime(int(message["ts"])))
         local = message["o"] == self.chat.store.node
@@ -986,17 +1154,81 @@ class ChatApp(App[None]):
                                          re.IGNORECASE):
                     body_part.stylize("bold #f9d56e", match.start(), match.end())
 
-        first_body_part = True
-        for body_part in self._render_message_body(body):
-            if isinstance(body_part, Text):
-                highlight_search(body_part)
-                if first_body_part:
-                    text.append_text(body_part)
+        card: PixelCard | PixelCardAnimation | None = None
+        card_reference: PixelCardReference | None = None
+        invalid_card = False
+        if body.startswith(CARD_REFERENCE_PREFIX):
+            try:
+                card_reference = decode_pixel_card_reference(body)
+                if card_reference is not None:
+                    payload = self.chat.store.attachment_blob_for(card_reference.digest)
+                    if payload is not None:
+                        card = verify_pixel_card_payload(payload, card_reference)
+            except ValueError:
+                invalid_card = True
+        elif body.startswith((CARD_MESSAGE_PREFIX, ANIMATION_MESSAGE_PREFIX)):
+            try:
+                card = decode_pixel_card_message(body)
+            except ValueError:
+                invalid_card = True
+        if isinstance(card, PixelCard) and card.animation_link:
+            card = self._linked_card_animation(card, message) or card
+        if card is not None:
+            identity = (message["o"], int(message["s"]))
+            if isinstance(card, PixelCardAnimation):
+                frame_index = card.frame_index(self._card_animation_now_ms())
+                self.pixel_card_animations[identity] = card
+                self.pixel_card_frame_indices[identity] = frame_index
+                displayed_card = card.frames[frame_index]
+                text.append(f"PixelQSO animation · {card.title}", style="bold #d8ccff")
+            else:
+                self.pixel_card_animations.pop(identity, None)
+                self.pixel_card_frame_indices.pop(identity, None)
+                frame_index = None
+                displayed_card = card
+                text.append(f"PixelQSO card · {card.title}", style="bold #d8ccff")
+            details = Text("\n          " +
+                           " · ".join(value for value in
+                                      (displayed_card.callsign, displayed_card.grid,
+                                       f"{displayed_card.width}×{displayed_card.height}",
+                                       f"{len(displayed_card.palette)} colors") if value),
+                           style="#9fb0c7")
+            if isinstance(card, PixelCardAnimation):
+                details.append(f" · frame {frame_index + 1}/2 · {card.frame_ms} ms/frame",
+                               style="#d2ae67")
+            elif card.animated:
+                link = card.animation_link or {}
+                details.append(f" · frame 2 → {link.get('first_card_id', 0):04X} · "
+                               "first frame not collected", style="#d2ae67")
+            parts.extend((details, render_pixel_card(displayed_card)))
+        elif card_reference is not None and not invalid_card:
+            ref_frame = card_reference.frames[0]
+            text.append(f"PixelQSO card · {card_reference.title}", style="bold #d8ccff")
+            details = Text("\n          " + " · ".join(value for value in
+                           (ref_frame.callsign, ref_frame.grid,
+                            f"{ref_frame.width}×{ref_frame.height}",
+                            f"{len(ref_frame.palette)} colors") if value),
+                           style="#9fb0c7")
+            if card_reference.is_linked_frame:
+                details.append(f" · frame 2 → {ref_frame.animation_link['first_card_id']:04X} · "
+                               f"{card_reference.frame_ms} ms/frame", style="#d2ae67")
+            details.append("\n          Not downloaded · request in Recent Attachments",
+                           style="#d2ae67")
+            parts.append(details)
+        elif invalid_card:
+            text.append("[invalid PixelQSO card reference/message]", style="bold #ff7d84")
+        else:
+            first_body_part = True
+            for body_part in self._render_message_body(body):
+                if isinstance(body_part, Text):
+                    highlight_search(body_part)
+                    if first_body_part:
+                        text.append_text(body_part)
+                    else:
+                        parts.append(body_part)
                 else:
                     parts.append(body_part)
-            else:
-                parts.append(body_part)
-            first_body_part = False
+                first_body_part = False
 
         footer = Text()
 
@@ -1020,10 +1252,16 @@ class ChatApp(App[None]):
         auth = self.chat.store.auth_for(message["o"], message["s"])
         if auth["status"] == "verified":
             append_footer(f"✓ Verified · {auth['signer']}", "bold #79d7b2")
+            if auth.get("reference"):
+                append_footer(auth["reference"], "#7f8793")
         elif auth["status"] == "signing_failed":
             append_footer("! Sent unsigned · ARAP signing failed; will retry", "bold #ffb86c")
         elif auth["status"] == "pending":
-            append_footer("⟳ Signature pending", "#a9a0d0")
+            if auth["proof"] is None:
+                append_footer("⟳ Resolving ARAP proof" if auth.get("reference")
+                              else "⟳ Signing with ARAP", "#a9a0d0")
+            else:
+                append_footer("⟳ Checking ARAP signature", "#a9a0d0")
         elif auth["status"] == "untrusted":
             append_footer(f"◌ Signed · {auth['signer']} · key not trusted", "#d2ae67")
         elif auth["status"] == "unverified":
@@ -1033,10 +1271,12 @@ class ChatApp(App[None]):
             append_footer("! Signature invalid", "bold #ff7d84")
         attachment = message.get("image") or self.chat.store.attachment_for(
             message["o"], int(message["s"]))
-        thumbnail = self.chat.store.image_for(attachment["digest"]) if attachment else None
-        if attachment and not thumbnail:
-            append_footer(f"▧ Thumbnail · {attachment['width']}×{attachment['height']} · "
-                          "select it in Recent Images to request", "#8a98ae")
+        is_image = attachment and attachment.get("kind", "image") == "image"
+        thumbnail = (self.chat.store.image_for(attachment["digest"])
+                     if is_image else None)
+        if is_image and not thumbnail:
+            append_footer(f"▧ Image · {attachment['width']}×{attachment['height']} · "
+                          "select it in Recent Attachments to request", "#8a98ae")
         if footer.plain:
             parts.append(footer)
         if thumbnail:
@@ -1047,6 +1287,12 @@ class ChatApp(App[None]):
         identity = (message["o"], int(message["s"]))
         # Fading changes only the background. Keep image/body rendering and
         # durable status queries out of repeated animation updates.
+        animation = self.pixel_card_animations.get(identity)
+        if animation is not None:
+            frame_index = animation.frame_index(self._card_animation_now_ms())
+            if self.pixel_card_frame_indices.get(identity) != frame_index:
+                self.pixel_card_frame_indices[identity] = frame_index
+                self.message_render_cache.pop(identity, None)
         rendered = self.message_render_cache.get(identity)
         if rendered is None:
             rendered = self._message_content(message)
@@ -1074,7 +1320,7 @@ class ChatApp(App[None]):
                 event, value = self.chat.events.get_nowait()
             except queue.Empty:
                 break
-            if event in {"receipt", "auth", "auth-policy", "image", "attachment",
+            if event in {"receipt", "auth", "auth-policy", "station-auth", "image", "attachment",
                          "reception", "refresh"}:
                 self.message_render_cache.clear()
             if event == "message":
@@ -1092,7 +1338,7 @@ class ChatApp(App[None]):
                         self.unread.pop(channel, None)
                         self.unread_mentions.pop(channel, None)
                 changed_channels = True
-                self._refresh_images()
+                self._refresh_attachments()
                 self._refresh_stats()
             elif event == "reception":
                 changed_messages = True
@@ -1118,9 +1364,14 @@ class ChatApp(App[None]):
                 count = int(value.get("count", 0))
                 self.last_status = f"ARAP policy changed; checking {count} signed messages"
                 self.query_one("#activity", Static).update(self._short_status(self.last_status))
+            elif event == "station-auth":
+                self._refresh_stations()
+                self.last_status = (f"ARAP authentication verified for {value['callsign']}; "
+                                    "status remains until local trust changes")
+                self.query_one("#activity", Static).update(self._short_status(self.last_status))
             elif event in {"image", "attachment"}:
                 changed_messages = True
-                self._refresh_images()
+                self._refresh_attachments()
                 if event == "image":
                     self.last_status = "Requested thumbnail received"
                     self.query_one("#activity", Static).update(self.last_status)
@@ -1138,7 +1389,7 @@ class ChatApp(App[None]):
                         self.unread[unread["c"]] = int(unread["messages"])
                         self.unread_mentions[unread["c"]] = int(unread["mentions"] or 0)
                 changed_channels = True
-                self._refresh_images()
+                self._refresh_attachments()
                 self._refresh_stats()
                 self.last_status = "Event backlog coalesced; refreshed from stored history"
                 self.query_one("#activity", Static).update(self._short_status(self.last_status))
@@ -1185,7 +1436,7 @@ class ChatApp(App[None]):
         if changed_messages:
             self._load_messages(preserve_scroll=True)
         if image_progress_changed:
-            self._refresh_images()
+            self._refresh_attachments()
         self._refresh_stations()
         self._refresh_tx_state()
 
@@ -1248,10 +1499,17 @@ class ChatApp(App[None]):
 
     def _refresh_stations(self) -> None:
         stations = self.chat.station_labels()
-        content = ("\n".join(f"●  {escape(nick)} · {escape(callsign)}"
-                            if nick.casefold() != callsign.casefold()
-                            else f"●  {escape(callsign)}"
-                            for nick, callsign in stations)
+        authenticated = self.chat.store.authenticated_stations()
+        lines = []
+        for nick, callsign in stations:
+            label = (f"●  {escape(nick)} · {escape(callsign)}"
+                     if nick.casefold() != callsign.casefold()
+                     else f"●  {escape(callsign)}")
+            proof = authenticated.get(callsign.upper())
+            if proof:
+                label += "  [dim green]✓ authenticated[/]"
+            lines.append(label)
+        content = ("\n".join(lines)
                    if stations else "Listening for stations…")
         try:
             self.query_one("#station-list", Static).update(content)
@@ -1260,22 +1518,31 @@ class ChatApp(App[None]):
             # during shutdown. There is no station panel to update then.
             return
 
-    def _refresh_images(self) -> None:
-        self.images = self.chat.store.recent_attachments(self.channel)
+    def _refresh_attachments(self) -> None:
+        self.attachments = self.chat.store.recent_attachments(self.channel)
         listing = self.query_one("#image-list", OptionList)
         listing.clear_options()
         options = []
-        for index, image in enumerate(self.images):
-            stamp = time.strftime("%H:%M", time.localtime(int(image["ts"])))
-            cached = self.chat.store.image_for(image["digest"]) is not None
+        for index, attachment in enumerate(self.attachments):
+            stamp = time.strftime("%H:%M", time.localtime(int(attachment["ts"])))
+            cached = self.chat.store.attachment_blob_for(attachment["digest"]) is not None
             if cached:
                 state = "✓"
             else:
                 received, total = self.chat.store.image_progress(
-                    image["origin"], int(image["seq"]))
+                    attachment["origin"], int(attachment["seq"]))
                 state = f"↻ {received}/{total}" if received else "↓"
-            label = (f"{state}  {escape(str(image['nick']))} · {stamp} · "
-                     f"{image['width']}×{image['height']}")
+            if attachment.get("kind", "image") == "card":
+                try:
+                    reference = decode_pixel_card_reference(attachment.get("metadata", ""))
+                except ValueError:
+                    reference = None
+                title = reference.title if reference else "PixelQSO card"
+                label = (f"{state}  Card · {escape(title)} · {stamp} · "
+                         f"{attachment['width']}×{attachment['height']}")
+            else:
+                label = (f"{state}  Image · {escape(str(attachment['nick']))} · {stamp} · "
+                         f"{attachment['width']}×{attachment['height']}")
             options.append(Option(label, id=f"image-{index}"))
         listing.add_options(options)
         if options:

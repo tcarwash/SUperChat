@@ -23,9 +23,10 @@ Messages have IRC style channels (`#general`, `#radio`, and so on), a display
 nick, and a local SQLite history. By default, history sync advertises and serves
 messages from the last 48 hours; `--sync-history-hours 24`, `4`, or `1` narrows
 that window, and the value is saved in the database. `--sync-history-messages N`
-sets a global cap across all origins for each sync exchange (`0` means unlimited);
-later exchanges can request more missing history. These settings limit radio
-sync only; other records remain in local history. A foreground broadcast client starts in
+sets a global cap across origins per sync exchange, up to the fixed maximum of
+36 messages (`0` uses that maximum; later exchanges can continue catch-up). The
+48-hour value is an age ceiling, not a request for 48 hours of traffic. These
+settings limit radio sync only; other records remain in local history. A foreground broadcast client starts in
 receive mode without an initial inventory burst. It periodically exchanges
 history by default, which lets clients recover messages lost when stations
 transmit at the same time. Use `/sync` to retry incomplete exchanges now or
@@ -46,8 +47,12 @@ History page fragments are public broadcasts: listeners store complete
 messages and announce their inventory later, without immediately rebroadcasting
 the fragments they just heard. When a peer has more history, clients
 request it in small batches. Inventories include sparse sequence bounds, and
-pages follow messages a station actually stores, so a missing sequence does not
-hide later cached messages or create empty page requests. Each station stores
+pages follow messages a station actually stores. Complete out-of-order messages
+heard in another station's history response are stored immediately and omitted
+from later sync requests. When sequence gaps remain on both sides of an already
+heard message, one fixed-binary request can name up to 36 missing sequences,
+so the separated gaps are fetched together rather than retransmitting the heard
+row. Larger catch-ups continue in additional bounded batches. Each station stores
 complete messages and can relay them later. A station that hears a message
 queues an inventory announcement for that origin; repeated messages are
 coalesced and the announcement is delayed randomly by up to 8 seconds to
@@ -121,16 +126,29 @@ uv run python scripts/simulate_mesh.py --topology line --loss 0.05 \
 
 To interact with three real clients through the same radio model, open one
 terminal window per station (requires a graphical session and `gnome-terminal`,
-`konsole`, or `xterm`):
+`konsole`, or `xterm`). To run the clients in a tmux session instead, pass
+`--terminal tmux` (requires tmux):
 
 ```sh
 uv run python scripts/interactive_mesh.py --topology line --loss 0.10 \
   --loss-model bursty --seed 7
 ```
 
+```sh
+uv run python scripts/interactive_mesh.py --terminal tmux --topology line \
+  --loss 0.10 --loss-model bursty --channel-busy-delay 0.5 --seed 7
+```
+
+`--channel-busy-delay` adds a configurable quiet period after each frame, during
+which other stations that hear the transmitter wait before accessing the
+simulated channel. It defaults to `0` and is fixture-only; `--time-scale`
+scales this delay along with the rest of simulated radio timing.
+
 Each window runs a normal client with a temporary database. Press Ctrl-C in the
 launcher terminal to stop the bridge, close its client processes, and remove
-those databases. The mesh log records the bridge start and shutdown reason.
+those databases. With tmux, attach using the printed command; stopping the
+launcher also closes the client session and removes those databases. The mesh
+log records the bridge start and shutdown reason.
 
 To capture a live trace, close the old client windows and run:
 
@@ -317,7 +335,8 @@ The wrapper creates encrypted test-only keys and a local trust store in a
 temporary directory, then removes them after the run. The report checks that
 the signature verifies at each station and the detached proof bytes match.
 This tests simulated transport and the real ARAP CLI; it does not test RF.
-For signed proof repair after stopping A's simulator process, run:
+To confirm an incomplete signed proof stays unverified after a dropped fragment,
+run:
 
 ```sh
 uv run python scripts/run_signed_mesh.py -- --topology line --loss 0 \
@@ -328,9 +347,10 @@ uv run python scripts/run_signed_mesh.py -- --topology line --loss 0 \
 
 The fixture verifies a trusted proof at B, stops A's chat process/database and
 radio receiver, then drops one B-to-C proof fragment during C's history sync.
-C must restore the exact proof through proof-only repair and verify it without
-another copy of the message body. A then restarts from its durable database.
-This does not emulate rebooting a physical modem or transmitting over RF.
+C keeps the message but leaves its incomplete proof unverified, with no
+proof-only retry or message-body replay. A then restarts from its durable
+database. This does not emulate rebooting a physical modem or transmitting
+over RF.
 `--loss` applies independent receive loss, while `--bitrate`, `--propagation`,
 `--interframe`, and `--framing-bytes` control radio timing. `--time-scale 0.1`
 runs simulated airtime ten times faster (script `wait` commands remain wall-clock
@@ -393,6 +413,8 @@ length integers, and binary station IDs replace JSON for control records.
 Specialized message, image, proof, and sync records keep their compact layouts.
 KC2 stations cannot exchange application records with KC1 stations, so update
 all stations in a mesh together.
+Sender-tagged message records are also a new KC2 subtype; upgrade every station
+before sending them, since older KC2 clients do not decode that subtype.
 Broadcast interactive traffic waits for its preceding ACKMODE receipt before
 the next frame is submitted, so messages typed while one is on air can be
 bundled together. Long records that do not fit remain separate. Receiving
@@ -580,13 +602,34 @@ incomplete thumbnail again asks caches only for the missing chunks. After an
 explicit request, SUperChat also retries missing chunks up to three times when
 radio frames are lost; completed thumbnails are never fetched automatically.
 
+## PixelQSO cards
+
+Use **＋ PixelQSO card** to choose a card from PixelQSO's `cards/` or
+`sent-cards/` library. The default library is `~/.local/share/PixelQSO`; set
+`PIXELQSO_DATA_DIR` to use another PixelQSO data folder. When the PixelQSO
+source checkout is alongside this project, its `examples/starter-cards/` are
+also listed; set `PIXELQSO_SOURCE_DIR` to locate another checkout. The picker
+shows a terminal preview of the highlighted individual card, including a
+linked frame's first-card ID and interval. Each card is a separate typed chat
+log entry with a compact metadata reference; its raster is cached locally by
+the sender and is transferred only when a receiver requests it from Recent
+Attachments. Unrequested cards do not enter the PixelQSO received-card archive.
+Linked animation frames remain separate cards/messages: the second card's link
+identifies the first, and the terminal plays the animation after both payloads
+are collected. Downloaded cards are saved as individual native PixelQSO
+`qso-log/*.json` entries under `received_cards`. Cards up to 64×64 pixels and
+32 colors are supported individually. Canvas editing is not supported. Older
+SUperChat versions display the compact card reference as text.
+
 ## Optional ARAP message verification
 
-SUperChat can sign each outgoing message with an ARAP Ed25519 content proof.
-The detached proof is sent in compact KISS frames and stored with the message,
-so always-on relays forward it with synchronized history. The signature binds
+SUperChat can optionally sign each outgoing message with an ARAP Ed25519 content proof.
+The proof is stored locally and published to a configured ARAP keyserver; only its
+19-byte `AR1` reference is sent over radio and relayed with synchronized history.
+Verifiers fetch the proof from the configured server over the network, then verify
+the signature, content, and local trust policy. The signature binds
 the origin ID, sequence, timestamp, channel, nick, signing callsign, and body.
-Attached thumbnails also bind their digest, dimensions, and size.
+Image attachment metadata and signed card references bind digest, dimensions, and size; downloaded raster bytes are checked against their digests.
 Clients display `✓ Verified` only when ARAP verifies both the proof and content
 and that client's ARAP trust store authorizes the signing key for
 `content-signature`. A cryptographically valid proof without local trust is
@@ -622,18 +665,32 @@ arap trust add --store ~/.config/arap/trust.json \
 
 Exchange public keys with stations you trust, place them in the same directory
 as `<CALLSIGN>.pub.pem`, and add them to the ARAP trust store with
-`arap trust add`. Start SUperChat with `--arap-key ~/.config/arap/N0CALL.age`;
+`arap trust add`. To accept `/auth` responses from a station, also trust its key
+for `challenge-response` with `arap trust add --store ~/.config/arap/trust.json --public-key ~/.config/kisschat/keys/AG7SU.pub.pem --callsign AG7SU --purpose challenge-response`. Start SUperChat with `--arap-key ~/.config/arap/N0CALL.age`;
 `--arap-cli`, `--arap-key-dir`, and `--arap-trust-store` select the CLI and
 local verification configuration. Set `KISSCHAT_ARAP_PASSPHRASE` in the
 process environment to sign with an encrypted key without an interactive
-prompt. ARAP callsigns must contain 3–20 ASCII letters, digits, and properly
+prompt. Set `ARAP_UPLOAD_TOKEN` for authenticated keyserver publishing, then add
+`--arap-server https://your-keyserver` (repeat the option to configure multiple
+resolvers). Enabling this online proof path sends proof uploads and lookup requests
+out of band over the network; only the AR1 reference travels over radio. If the
+server or network is unavailable, signing and chat delivery remain best effort,
+and messages stay unchecked until their proofs can be fetched. ARAP callsigns must contain 3–20 ASCII letters, digits, and properly
 placed slashes, with at least one letter and one digit. A Data2G callsign that
 does not meet ARAP's grammar can still chat, but its messages cannot be signed
 or shown as ARAP-verified. Signing is disabled when `--arap-key` is omitted. All participating
-clients need this proof-capable version to show verified badges; older clients
-ignore proof frames and still display the message. The default Docker image
+clients need this reference-capable version and network access to the configured
+ARAP keyserver to show verified badges; older clients still display the message
+but do not understand AR1 references. The default Docker image
 does not bundle the separately maintained ARAP CLI; for Compose signing, build
 a derived image that includes `arap` and mount the key and trust directories.
+
+Use `/auth CALLSIGN` for a one-time fresh challenge-response over radio. The
+target signs the nonce with its ARAP key; the requester verifies it under the
+local `challenge-response` trust policy. A successful station-list indicator
+means that key proved control. It remains until the local ARAP trust
+policy changes, which clears saved station-auth indicators. This is separate
+from each message's signature badge.
 
 ## Docker Compose
 
@@ -689,32 +746,40 @@ updated inventory later instead of echoing the same fragments. The page-end
 record stays addressed to the requester and lists the message sequence numbers
 it covered. The receiver asks for only missing fragment indices when it retained
 a partial message; if no fragment arrived, it requests the whole message.
-Page-end records and fragment-repair requests use compact binary forms to fit
-their sequence and bitmask data in one frame.
-ARAP COSE proofs use a separate versioned frame record and are independently
-reassembled, stored, and forwarded alongside their messages. When message
-history already matches, peers periodically request a recent proof-only page
-so dropped signature frames can be repaired without replaying message bodies.
+Page-end records and fragment-repair requests use compact binary forms.
+Sparse history requests use a fixed binary sequence list (up to 36 IDs per
+220-byte frame) rather than a JSON range query; the matching page-end carries
+the same sequence list so listeners can verify exactly which records the batch
+covered.
+ARAP proof references use a compact record tied to the message origin and
+sequence. Relays forward the reference with synchronized history; each receiver
+fetches and caches the full proof out of band before verifying it. Messages
+without a resolvable proof remain unchecked. Legacy proof-fragment records are
+still accepted, but new signatures use online references.
 The default maximum message length is 4096 UTF-8 bytes. Message history is
 stored per origin with a monotonically increasing sequence number. A newly
 heard peer advertises contiguous history, after which the clients exchange missing
-records in batches of up to 8 messages. History fragments and signature proofs
-use the bulk transmit queue so chat and control traffic can pass them. Imported records are re-advertised so
+records in batches of up to 8 messages. History fragments use the bulk transmit
+queue so chat and control traffic can pass them. Imported records are re-advertised so
 nearby clients can fetch and relay them. Mentions use durable application
 receipt records that are sent only after the recipient has stored the complete message.
 For each origin window, a client requests one directly heard cache at a time.
-Inventories include an optional signature availability mask, allowing new peers
-to skip proof requests for unsigned history. Older inventories retain bounded
-proof discovery, and old clients can still read the inventory and message records.
+Inventories may include a signature-availability mask for compatible clients.
+Old clients can still read the inventory and message records. The new
+sparse-sequence `S` request subtype is
+pre-1.0 wire format; synchronize with matching builds until the first stable
+release.
 
 The conversation stays in message timestamp order, including late history repairs.
 New arrivals have a subtle background that fades over 12 seconds. Nickname colors
 and symbols distinguish your messages (purple), directly heard messages (teal),
 and relayed messages (amber, ↪). A neutral question mark means the path is unknown.
-Raw AX.25 reception retains source and digipeater evidence for this distinction;
-a directly heard unaddressed message also identifies its origin without waiting
-for an inventory. Older stored messages and transports without source metadata
-remain unknown.
+Raw AX.25 reception retains actual source and digipeater evidence. Data2G and
+connected message records carry the transmitting node ID: the origin is direct,
+and another node forwarding cached history is relayed. This is self-reported
+application provenance, not proof of physical RF route; a transparent RF
+repeater remains undetectable. Older untagged messages and transports without
+source metadata remain unknown.
 Reception colors describe the path, independently of signature verification.
 KISS ACKMODE receipts pace the broadcast writer with at most 32 frames in
 flight. A receipt confirms only that Data2G sent a frame on air; it does not

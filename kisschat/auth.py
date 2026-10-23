@@ -49,10 +49,12 @@ def _inspect_claims(document: object) -> tuple[str, str]:
 
 class ARAPAuth:
     def __init__(self, *, cli: str = "arap", callsign: str = "", key: str = "",
-                 key_dir: str = "", trust_store: str = "", passphrase_env: str = ""):
+                 key_dir: str = "", trust_store: str = "", passphrase_env: str = "",
+                 servers: list[str] | None = None):
         self.cli, self.callsign, self.key = cli, callsign.upper(), key
         self.key_dir, self.trust_store = key_dir, trust_store
         self.passphrase_env = passphrase_env
+        self.servers = [server.strip().rstrip("/") for server in (servers or []) if server.strip()]
 
     @property
     def enabled(self) -> bool:
@@ -181,6 +183,108 @@ class ARAPAuth:
                                    f"ARAP signing exited {result.returncode}")
             return proof.read_bytes()
 
+    def publish(self, proof: bytes, server: str | None = None) -> str:
+        """Publish a proof out of band and return ARAP's compact AR1 token."""
+        server = server or (self.servers[0] if self.servers else "")
+        if not server:
+            raise ValueError("ARAP proof publication requires a keyserver URL")
+        with tempfile.TemporaryDirectory(prefix="kisschat-arap-publish-") as directory:
+            path = Path(directory) / "proof.cose"
+            path.write_bytes(proof)
+            result = self._run(["publish", "--server", server, "--proof", str(path)])
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode("utf-8", "replace").strip() or
+                                   f"ARAP proof publication exited {result.returncode}")
+            value = json.loads(result.stdout)
+            reference = value.get("reference") if isinstance(value, dict) else None
+            if (not isinstance(reference, str) or len(reference) != 19 or
+                    not reference.startswith("AR1") or
+                    not re.fullmatch(r"AR1[A-Z2-7]{16}", reference)):
+                raise ValueError("ARAP publish returned an invalid AR1 reference")
+            return reference
+
+    def resolve(self, reference: str, servers: list[str] | None = None) -> bytes:
+        """Fetch a proof by AR1 from configured resolvers; ARAP checks its hash."""
+        servers = servers or self.servers
+        if (not isinstance(reference, str) or
+                not re.fullmatch(r"AR1[A-Z2-7]{16}", reference) or not servers):
+            raise ValueError("invalid AR1 reference or no ARAP resolver configured")
+        with tempfile.TemporaryDirectory(prefix="kisschat-arap-resolve-") as directory:
+            path = Path(directory) / "proof.cose"
+            args = ["resolve"]
+            for server in servers[:8]:
+                args.extend(("--server", server))
+            args.extend(("--reference", reference, "--out", str(path)))
+            result = self._run(args)
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode("utf-8", "replace").strip() or
+                                   f"ARAP proof resolution exited {result.returncode}")
+            proof = path.read_bytes()
+            if not proof:
+                raise ValueError("ARAP resolver returned an empty proof")
+            return proof
+
+    def issue_challenge(self, responder: str, store: str, output: str) -> dict:
+        if not self.enabled:
+            raise ValueError("configure an ARAP signing key before requesting authentication")
+        result = self._run(["challenge", "issue", "--requester", self.callsign,
+                            "--responder", responder, "--store", store,
+                            "--out", output])
+        if result.returncode:
+            raise RuntimeError(result.stderr.decode("utf-8", "replace").strip() or
+                               f"ARAP challenge issue exited {result.returncode}")
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict) or not isinstance(value.get("request_sha256"), str):
+            raise ValueError("ARAP challenge issue returned an invalid response")
+        return value
+
+    def respond_challenge(self, request: bytes) -> bytes:
+        if not self.enabled:
+            raise ValueError("configure an ARAP signing key before responding to authentication")
+        with tempfile.TemporaryDirectory(prefix="kisschat-arap-challenge-") as directory:
+            root = Path(directory)
+            source, response = root / "request.cbor", root / "response.cbor"
+            source.write_bytes(request)
+            args = ["challenge", "respond", "--request", str(source), "--key", self.key,
+                    "--callsign", self.callsign, "--out", str(response)]
+            secret = os.environ.get(self.passphrase_env) if self.passphrase_env else None
+            stdin = None
+            if secret is not None:
+                args.append("--passphrase-stdin")
+                stdin = secret.encode("utf-8") + b"\n"
+            result = self._run(args, stdin=stdin)
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode("utf-8", "replace").strip() or
+                                   f"ARAP challenge response exited {result.returncode}")
+            return response.read_bytes()
+
+    def verify_challenge(self, request: str, response: bytes, responder: str,
+                         store: str) -> dict:
+        if not self.trust_store or not self.key_dir:
+            raise ValueError("configure the ARAP trust store and public-key directory")
+        safe_call = responder.upper().replace("/", "-")
+        public_key = Path(self.key_dir) / f"{safe_call}.pub.pem"
+        if not public_key.is_file():
+            raise ValueError(f"no local ARAP public key for {responder}")
+        with tempfile.TemporaryDirectory(prefix="kisschat-arap-verify-challenge-") as directory:
+            proof = Path(directory) / "response.cbor"
+            proof.write_bytes(response)
+            result = self._run(["challenge", "verify-response", "--request", request,
+                                "--response", str(proof), "--public-key", str(public_key),
+                                "--trust-store", self.trust_store, "--store", store,
+                                "--requester", self.callsign])
+            try:
+                value = json.loads(result.stdout)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                value = None
+            if not isinstance(value, dict):
+                detail = result.stderr.decode("utf-8", "replace").strip()
+                raise ValueError(detail or "ARAP returned no challenge verification result")
+            if result.returncode != 0 or value.get("overall_policy") != "accepted":
+                raise ValueError(str(value.get("reason") or
+                                     f"ARAP challenge policy: {value.get('overall_policy', 'unknown')}"))
+            return value
+
     def verify(self, message: dict, proof: bytes) -> tuple[str, str, str]:
         """Return status, signer, detail. Only ARAP policy acceptance is verified."""
         key_dir = Path(self.key_dir) if self.key_dir else None
@@ -234,7 +338,10 @@ class ARAPAuth:
             verified_claims = verification.get("claims")
             verified_signer = (verified_claims.get("signer")
                                if isinstance(verified_claims, dict) else None)
-            if (signature == "valid" and integrity == "valid" and
+            # The CLI's exit status is part of its verification contract:
+            # only exit 0 means policy accepted. Do not promote an inconsistent
+            # structured response from a failing CLI invocation to verified.
+            if (result.returncode == 0 and signature == "valid" and integrity == "valid" and
                     identity == "trusted" and policy == "accepted" and
                     isinstance(verified_signer, str) and
                     verified_signer.upper() == signer and

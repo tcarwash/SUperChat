@@ -5,7 +5,8 @@ import unittest
 from unittest.mock import patch
 
 from kisschat.app import Chat
-from kisschat.protocol import pack, unpack
+from kisschat.protocol import (MAX_FRAME, MAX_SPARSE_SEQUENCE_REQUESTS,
+                               message_parts, pack, unpack)
 from scripts.simulate_mesh import make_args
 
 
@@ -49,7 +50,9 @@ class SyncAirtimeTests(unittest.TestCase):
         request = self.records()[0]
         self.assertEqual((request['t'], request['ttl']), ('q', 0))
         self.assertLess(len(self.chat.data.sent[0][0]), 90)
-        self.assertEqual(request['h'], [])
+        self.assertEqual(request['r'], [1])
+        self.assertNotIn('h', request)
+        self.assertEqual(self.chat.data.sent[0][0][3:4], b'S')
 
     def test_matching_unsigned_inventory_and_summary_are_quiet(self):
         self.chat.store.insert(self.origin, 1, '#general', 'Bob', int(time.time()), 'hello')
@@ -57,19 +60,17 @@ class SyncAirtimeTests(unittest.TestCase):
         self.hear(dict(t='k', **{'from': self.peer}, h=[[self.origin, 1, 1]]))
         self.assertEqual(self.records(), [])
 
-    def test_signature_advertisement_repairs_missing_proofs(self):
+    def test_signature_advertisement_does_not_request_proof_only_pages(self):
         self.chat.store.insert(self.origin, 1, '#general', 'Bob', int(time.time()), 'hello')
         self.hear(self.inventory(sig=1))
-        self.assertEqual(len(self.records()), 1)
-        self.assertTrue(self.records()[0]['v'])
-        self.assertEqual(self.records()[0]['ttl'], 0)
+        self.assertEqual(self.records(), [])
 
-    def test_legacy_inventory_still_discovers_proofs(self):
+    def test_inventory_without_proof_availability_does_not_probe_proofs(self):
         self.chat.store.insert(self.origin, 1, '#general', 'Bob', int(time.time()), 'hello')
         self.hear(self.inventory())
-        self.assertTrue(self.records()[0]['v'])
+        self.assertEqual(self.records(), [])
 
-    def test_completed_proofs_do_not_get_requested_again(self):
+    def test_completed_proofs_remain_quiet_on_inventory(self):
         self.chat.store.insert(self.origin, 1, '#general', 'Bob', int(time.time()), 'hello')
         self.chat.store.set_auth(self.origin, 1, b'proof', 'pending')
         self.hear(self.inventory(sig=1))
@@ -156,7 +157,124 @@ class SyncAirtimeTests(unittest.TestCase):
         message_response = [r for r in response if r['t'] == 'd']
         self.assertEqual([r['s'] for r in message_response], list(range(11, 16)))
         self.assertTrue(all(r['o'] == self.origin for r in message_response))
+        self.assertTrue(all(r['from'] == self.chat.store.node for r in message_response))
         self.assertEqual(response[-1]['t'], 'e')
+        for payload, _ in self.chat.data.sent:
+            record = unpack(payload)
+            if record and record.get('t') == 'd':
+                receiver._on_frame(0, payload)
+        self.assertEqual(receiver.store.reception_for(self.origin, 11), 'relayed')
+
+    def test_overheard_out_of_order_message_is_skipped_in_one_sparse_binary_sync(self):
+        timestamp = int(time.time())
+        for seq in range(1, 16):
+            self.chat.store.insert(self.origin, seq, '#general', 'Bob',
+                                   timestamp, f'history {seq}')
+        listener = Chat(make_args('C', 'Carol', self.temp.name + '/c.sqlite'))
+        listener.data = RecordingRadio()
+        self.addCleanup(listener.close)
+
+        heard = self.chat.store.messages_between(self.origin, 9, 10, limit=1)[0]
+        for frame in message_parts(origin=heard['o'], seq=heard['s'], channel=heard['c'],
+                                   nick=heard['n'], timestamp=heard['ts'], text=heard['b'],
+                                   sender=self.chat._message_sender_id()):
+            listener._on_frame(0, frame)
+        self.assertTrue(listener.store.has_message(self.origin, 10))
+        self.assertEqual(listener.store.contiguous(self.origin), 0)
+
+        inventory = {'t': 'k', 'from': self.chat.store.node,
+                     'h': [[self.origin, 1, 15]]}
+        listener._on_frame(0, pack(inventory))
+        self.assertEqual(len(listener.data.sent), 1)
+        request_wire = listener.data.sent[0][0]
+        request = unpack(request_wire)
+        expected_missing = [*range(1, 10), *range(11, 16)]
+        self.assertEqual(request['r'], expected_missing)
+        self.assertNotIn('h', request)
+        self.assertEqual(request_wire[3:4], b'S')
+
+        self.chat.data.sent.clear()
+        self.chat._on_frame(0, request_wire)
+        response = [unpack(payload) for payload, _ in self.chat.data.sent]
+        data_records = [record for record in response if record and record.get('t') == 'd']
+        end_records = [record for record in response if record and record.get('t') == 'e']
+        self.assertEqual({record['s'] for record in data_records}, set(expected_missing))
+        self.assertEqual(len(data_records), len(expected_missing))
+        self.assertTrue(all(not record.get('to') for record in data_records))
+        self.assertEqual(len(end_records), 1)
+        for payload, _ in self.chat.data.sent:
+            record = unpack(payload)
+            if record and record.get('t') in {'d', 'e'}:
+                listener._on_frame(0, payload)
+        self.assertTrue(all(listener.store.has_message(self.origin, seq)
+                            for seq in range(1, 16)))
+        self.assertEqual(listener.store.contiguous(self.origin), 15)
+
+        listener.data.sent.clear()
+        listener._on_frame(0, pack(inventory))
+        self.assertEqual(listener.data.sent, [])
+
+    def test_sparse_binary_sync_caps_each_exchange_at_36_and_skips_heard_rows(self):
+        timestamp = int(time.time())
+        for seq in range(1, 51):
+            self.chat.store.insert(self.origin, seq, '#general', 'Bob',
+                                   timestamp, f'history {seq}')
+        listener = Chat(make_args('C', 'Carol', self.temp.name + '/large-c.sqlite'))
+        listener.data = RecordingRadio()
+        self.addCleanup(listener.close)
+        heard = self.chat.store.messages_between(self.origin, 24, 25, limit=1)[0]
+        for frame in message_parts(origin=heard['o'], seq=heard['s'], channel=heard['c'],
+                                   nick=heard['n'], timestamp=heard['ts'], text=heard['b'],
+                                   sender=self.chat._message_sender_id()):
+            listener._on_frame(0, frame)
+
+        listener._on_frame(0, pack({'t': 'k', 'from': self.chat.store.node,
+                                    'h': [[self.origin, 1, 50]]}))
+        requests = [payload for payload, _ in listener.data.sent
+                    if (record := unpack(payload)) and record.get('t') == 'q']
+        self.assertEqual(len(requests), 1)
+        first_request = unpack(requests[0])
+        self.assertFalse(first_request['x'])
+        self.assertEqual(len(first_request['r']), MAX_SPARSE_SEQUENCE_REQUESTS)
+        self.assertEqual(requests[0][3:4], b'S')
+        self.assertEqual(len(requests[0]), MAX_FRAME - 1)
+
+        def serve(request_wire):
+            self.chat.data.sent.clear()
+            self.chat._on_frame(0, request_wire)
+            response_frames = list(self.chat.data.sent)
+            response = [unpack(payload) for payload, _ in response_frames]
+            data_records = [item for item in response if item and item.get('t') == 'd']
+            end_records = [item for item in response if item and item.get('t') == 'e']
+            self.assertEqual(len(end_records), 1)
+            listener.data.sent.clear()
+            for (payload, _), item in zip(response_frames, response):
+                if item and item.get('t') in {'d', 'e'}:
+                    listener._on_frame(0, payload)
+            return [item['s'] for item in data_records]
+
+        first_sequences = serve(requests[0])
+        self.assertEqual(len(first_sequences), 36)
+        self.assertEqual(set(first_sequences), set(range(1, 38)) - {25})
+        self.assertEqual(listener.store.contiguous(self.origin), 37)
+        self.assertFalse(any(listener.store.has_message(self.origin, seq)
+                             for seq in range(38, 51)))
+
+        listener.sync(retry=True, discover=False)
+        listener.data.sent.clear()
+        listener._on_frame(0, pack({'t': 'k', 'from': self.chat.store.node,
+                                    'h': [[self.origin, 1, 50]]}))
+        next_requests = [payload for payload, _ in listener.data.sent
+                         if (record := unpack(payload)) and record.get('t') == 'q']
+        self.assertEqual(len(next_requests), 1)
+        next_request = unpack(next_requests[0])
+        self.assertEqual(next_request['r'], list(range(38, 51)))
+        self.assertFalse(next_request['x'])
+        second_sequences = serve(next_requests[0])
+        self.assertEqual(second_sequences, list(range(38, 51)))
+        self.assertTrue(all(listener.store.has_message(self.origin, seq)
+                            for seq in range(1, 51)))
+        self.assertEqual(listener.store.contiguous(self.origin), 50)
 
     def test_history_sync_settings_persist_for_the_database(self):
         args = make_args('B', 'Bob', self.temp.name + '/settings.sqlite')
@@ -234,14 +352,13 @@ class SyncAirtimeTests(unittest.TestCase):
         message_rows = [record for record in response if record['t'] == 'd']
         self.assertEqual([record['s'] for record in message_rows], [2])
 
-    def test_signature_can_be_repaired_after_message_window_completed(self):
+    def test_signature_advertisement_does_not_retry_after_message_window_completed(self):
         self.chat.store.insert(self.origin, 1, '#general', 'Bob', int(time.time()), 'hello')
         self.chat.completed_sync_windows[(self.origin, 0, 1)] = time.monotonic() + 300
         self.hear(self.inventory(sig=0))
         self.assertEqual(self.records(), [])
         self.hear(self.inventory(sig=1))
-        self.assertEqual(len(self.records()), 1)
-        self.assertTrue(self.records()[0]['v'])
+        self.assertEqual(self.records(), [])
 
     def test_nodes_do_not_repeat_the_same_collision_retry_deadline(self):
         now = time.monotonic()

@@ -61,6 +61,15 @@ class ARAPVerificationTests(unittest.TestCase):
             status, _, _ = self.auth.verify(self.message, b"proof")
         self.assertEqual(status, "untrusted")
 
+    def test_accepted_json_with_failing_cli_exit_is_not_verified(self):
+        result = {"cryptographic_signature": "valid", "content_integrity": "valid",
+                  "callsign_identity": "trusted", "overall_policy": "accepted",
+                  "claims": {"signer": "N0CALL", "key_id_sha256": self.fingerprint}}
+        _, mocked = self.run_sequence(result, verify_code=2)
+        with mocked:
+            status, _, _ = self.auth.verify(self.message, b"proof")
+        self.assertEqual(status, "unverified")
+
     def test_incomplete_or_malformed_result_never_becomes_verified(self):
         result = {"cryptographic_signature": "valid", "content_integrity": "valid",
                   "callsign_identity": "trusted", "overall_policy": "accepted"}

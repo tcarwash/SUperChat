@@ -56,6 +56,7 @@ class Mesh:
                  drop_first_image_fragment: bool,
                  drop_first_proof_fragment: bool,
                  delay_first_history_page_end: float = 0.0,
+                 channel_busy_delay: float = 0.0,
                  debug_log: str | None = None):
         self.loss = loss
         self.loss_model = loss_model
@@ -68,6 +69,7 @@ class Mesh:
         self.interframe = interframe
         self.framing_bytes = framing_bytes
         self.contention_window = contention_window
+        self.channel_busy_delay = channel_busy_delay
         self.time_scale = time_scale
         self.transport = transport
         self.trace_sync = trace_sync
@@ -331,8 +333,11 @@ class Mesh:
                     return
                 now = time.monotonic()
                 heard = set(self.neighbors[radio.name])
-                busy_until = max((other.start + other.duration for other in self.active
-                                  if other.start + other.duration > now and
+                busy_until = max((other.start + other.duration +
+                                  self.channel_busy_delay * self.time_scale
+                                  for other in self.active
+                                  if other.start + other.duration +
+                                  self.channel_busy_delay * self.time_scale > now and
                                   other.station in heard), default=now)
                 if busy_until > now:
                     continue
@@ -370,8 +375,8 @@ class Mesh:
                 break
         time.sleep(max(0, duration * self.time_scale))
         with self.lock:
-            self.active = [item for item in self.active if item is not tx]
             if self.stopping:
+                self.active = [item for item in self.active if item is not tx]
                 return
             listeners = set(self.neighbors[radio.name])
         drop_indices: set[int] = set()
@@ -428,6 +433,10 @@ class Mesh:
                     self.dropped_proof_fragment = True
                     self.proof_drop_armed = False
                     self.dropped_proof_index = int(dropped["i"])
+                    self.proof_history_rx_baseline = (
+                        self.stats[recipient_station]["history_data_received"])
+                    self.proof_page_rx_baseline = (
+                        self.stats[recipient_station]["proof_fragments_received"])
                     targeted_drop_indices.setdefault(recipient_station, set()).add(index)
                     self.log(f"[mesh] deterministically dropped proof chunk "
                              f"{self.dropped_proof_index} on B→{recipient_station}")
@@ -503,6 +512,10 @@ class Mesh:
                         continue
                     self.delivery_timers.add(timer)
                     timer.start()
+        if self.channel_busy_delay:
+            time.sleep(self.channel_busy_delay * self.time_scale)
+        with self.lock:
+            self.active = [item for item in self.active if item is not tx]
 
     def report(self) -> None:
         elapsed = time.monotonic() - self.started
@@ -696,6 +709,8 @@ def main() -> None:
                         help="estimated framing/preamble bytes added to airtime (default 24)")
     parser.add_argument("--contention-window", type=float, default=0.5,
                         help="maximum random channel-access backoff in seconds (default 0.5)")
+    parser.add_argument("--channel-busy-delay", type=float, default=0.0,
+                        help="keep the channel busy this many seconds after each transmission")
     parser.add_argument("--batch-window", type=float, default=0.08,
                         help="seconds to collect queued records for a compressed frame")
     parser.add_argument("--image-pattern", choices=("solid", "noise"), default="solid",
@@ -732,7 +747,8 @@ def main() -> None:
     if (not 0 <= opts.loss <= 1 or not 0 < opts.burst_recovery <= 1 or
             opts.bitrate <= 0 or opts.propagation < 0 or
             opts.interframe < 0 or opts.framing_bytes < 0 or
-            opts.contention_window < 0 or opts.batch_window < 0 or
+            opts.contention_window < 0 or opts.channel_busy_delay < 0 or
+            opts.batch_window < 0 or
             opts.delay_first_history_page_end < 0 or
             opts.sync_retry_seconds <= 0 or
             not 0 < opts.time_scale <= 10):
@@ -743,6 +759,7 @@ def main() -> None:
     mesh = Mesh(loss=opts.loss, bitrate=opts.bitrate, propagation=opts.propagation,
                 interframe=opts.interframe, framing_bytes=opts.framing_bytes,
                 contention_window=opts.contention_window,
+                channel_busy_delay=opts.channel_busy_delay,
                 time_scale=opts.time_scale, seed=opts.seed, topology=opts.topology,
                 loss_model=opts.loss_model, burst_recovery=opts.burst_recovery,
                 transport=opts.transport,
@@ -1012,16 +1029,26 @@ def main() -> None:
                 valid_signature = (not mesh.proof_expected_signed or
                                    (auth["status"] == "verified" and
                                     auth["signer"] == CALLSIGNS[origin_station]))
-                passed = (proof == mesh.expected_proof and valid_signature and
-                          mesh.dropped_proof_fragment and
-                          mesh.proof_page_requests > 0 and history_unchanged and
-                          proof_page_retransmitted)
-                if passed:
-                    mesh.log("PROOF REPAIR PASS: dropped proof fragment recovered byte-for-byte "
-                             "without replaying the message body")
+                if mesh.dropped_proof_fragment and proof is None:
+                    # A partial detached proof stays unchecked; no proof-only
+                    # retry is generated for this message.
+                    passed = (auth["status"] != "verified" and
+                              mesh.proof_page_requests == 0 and history_unchanged and
+                              not proof_page_retransmitted)
+                    if passed:
+                        mesh.log("INCOMPLETE PROOF PASS: message remains unverified; "
+                                 "no proof-only retry or body replay")
                 else:
+                    passed = (proof == mesh.expected_proof and valid_signature and
+                              mesh.dropped_proof_fragment and
+                              mesh.proof_page_requests > 0 and history_unchanged and
+                              proof_page_retransmitted)
+                    if passed:
+                        mesh.log("PROOF REPAIR PASS: dropped proof fragment recovered byte-for-byte "
+                                 "without replaying the message body")
+                if not passed:
                     verification_failed = True
-                    mesh.log("PROOF REPAIR FAIL: "
+                    mesh.log("INCOMPLETE PROOF FAIL: "
                              f"proof-match={proof == mesh.expected_proof}, "
                              f"trusted-signature={valid_signature}, "
                              f"dropped={mesh.dropped_proof_fragment}, "

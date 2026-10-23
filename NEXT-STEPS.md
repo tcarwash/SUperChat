@@ -39,6 +39,16 @@ badges. Known boundaries visible in source:
 
 ## Progress log
 
+- 2026-10-22 ARAP airtime/auth update: new signatures publish to configured ARAP
+  keyservers and carry only the 19-byte AR1 reference on radio; receivers resolve
+  and cache the full proof out of band, then apply local signature/content/trust
+  checks. The message UI shows the reference in subdued text beside the verified
+  mark. `/auth CALLSIGN` issues a fresh ARAP challenge, returns a signed response
+  over radio, and shows a persistent station-auth indicator until local trust
+  policy changes. CLI help, startup status, and README describe the network data
+  exchange. Python AST parsing and `git diff --check` passed; no tests, simulator,
+  live keyserver, or RF validation were run for this update.
+
 - 2026-10-21 orphaned-caption fix: in the current live trace, A's caption
   (origin d6dfd5, sequence 2, "dorc") reached B at 19:18:25 UTC, but the separate
   attachment record collided at 19:18:27. A's read-only database inspection showed
@@ -175,37 +185,27 @@ badges. Known boundaries visible in source:
   passed: A's 309-byte proof crossed B to C, all three clients reported
   `verified`, and the stored proof bytes matched exactly. The machine report
   includes per-station verification status and proof size. The run used zero
-  configured packet loss; its two-fragment proof produced 4/6/4 outgoing proof
-  fragments at A/B/C, so duplicate/repair overhead still needs measurement. A
-  remained online for this loss-free run; the separate proof-loss fixture below
-  covers repair with A radio-isolated. No production keys or RF were used.
-- Suppressed needless proof-page requests after a message page completes when
-  every message on that page already has its complete proof stored. The real
-  signed A→B→C fixture still verifies at all three stations; compared with the
-  prior same-seed run, B's transmitted proof-fragment records fell from 6 to 4
-  for this two-fragment proof, and the observed proof-page request count fell
-  from 2 to 1. The deterministic lost-proof-fragment fixture still repaired the
-  missing proof byte-for-byte without replaying the body. Exact airtime remains
-  scheduler-sensitive; no RF result is implied.
+  configured packet loss; complete proofs verified at A, B, and C. No
+  production keys or RF were used. Automatic proof-only retries have since
+  been removed: a missing or partial proof stays unverified.
 - Added a real-ARAP process-stop proof-loss fixture: A signed a message while
   B↔C was partitioned, B stored and verified it, and the simulator stopped A's
   Chat, database connection and radio receiver before C requested A's history
   through B. C started with neither body nor proof. The fixture dropped B→C
-  proof fragment 0; C received the body, requested proofs only, recovered
-  byte-identical proof bytes from B, and verified K0AAA without body replay. A
-  then restarted with the same database identity and trusted proof. The JSON
-  report records A stopped/restarted, an offline-origin sync, a verified signed
-  proof at C and no body replay. A separate unsigned fixture now restarts all
+  proof fragment 0; C received the body and left the incomplete proof
+  unverified without proof-only retry traffic or body replay. A then restarted
+  with the same database identity and trusted proof. The JSON report records A
+  stopped/restarted, an offline-origin sync, the incomplete proof at C, and no
+  body replay. A separate unsigned fixture now restarts all
   three Chat processes and reconverges after an explicit sync. Modem restart and
   RF remain untested.
 - Added deterministic detached-proof loss to the line simulator. The fixture
   transfers an opaque 760-byte proof from A to B while B↔C is partitioned,
   drains and verifies the relay cache, then drops one B→C proof fragment during
-  C's history sync. The proof-only page restores identical bytes, and the check
-  confirms no message-body replay. Its JSON report records the dropped index,
-  repair-page counters and restored-byte result: chunk 0 dropped, 3 partial
-  chunks at the proof-page request, 4 retransmitted, 7 total at C, and no body
-  replay. This validates transport and storage only; it does not use a
+  C's history sync. C keeps the message unverified and sends no proof-only
+  request or message-body replay. Its JSON report records the dropped index,
+  zero proof-page requests and unchanged body count. This validates transport
+  and storage only; it does not use a
   cryptographically valid ARAP proof.
 - Added `/clear-history` with a confirmation dialog. It purges local messages,
   image cache, receipts and partial transfers, clears in-memory sync retry state,
@@ -278,8 +278,9 @@ badges. Known boundaries visible in source:
 - The bursty-loss runner now passed at 5%, 15% and 30% on the line fixture; the
   saved JSON report records the selected Gilbert-Elliott parameters and each
   run's exit/pass state. A deterministic requested-image-chunk drop also
-  converged through selective repair, and opaque detached-proof repair now
-  passes without body replay. ARAP-valid signed-proof behavior under loss,
+  converged through selective repair. Incomplete detached proofs now remain
+  unverified without proof-only retry traffic or body replay. ARAP-valid
+  signed-proof behavior under loss,
   lost inventory announcements and modem-level delayed ACKs remain open; the
   application page-end delay and retry path now pass separately.
 
@@ -393,11 +394,10 @@ malformed or unavailable verifier output cannot produce a verified badge.
   storage, restart and fragment repair. Handle proof/body/metadata arrival in
   any order without premature verification or permanent false-invalid status.
   A real-ARAP A→B→C proof crossed the line and verified byte-identically; proof
-  loss repair with A's process stopped now passes, including one dropped proof
-  fragment and a proof-only repair from B. Restart of every station, modem
-  restart, and arbitrary arrival-order coverage remain open.
-  History completion now skips proof-page requests when all page proofs are
-  already stored; live/in-flight proof races still need broader coverage.
+  loss with A's process stopped now confirms a dropped proof fragment leaves
+  the message unverified, with no proof-only retry or body replay. Restart of
+  every station, modem restart, and arbitrary arrival-order coverage remain
+  open. Complete proofs continue to verify byte-identically across A→B→C.
 - Apply explicit proof size, fragment, retry and queue limits. Fit the actual
   ARAP profile into transport limits and reject oversize proofs visibly.
 - Keep proofs with messages by default so verification works without Internet.
@@ -441,11 +441,12 @@ results, per-record traces, database comparisons and an overall failure exit cod
 - [partial] The seeded independent-loss 0%, 5%, 15% and 30% line-topology
   matrix and bursty-loss 5%, 15% and 30% line matrix pass. Exact counters can
   vary with host thread scheduling. Deterministic requested-thumbnail loss
-  proves selective repair and digest completion; opaque proof loss proves
-  proof-only repair without body replay; lost history page-end retry proves a
+  proves selective repair and digest completion; proof loss proves the message
+  remains unverified without proof-only traffic or body replay; lost history
+  page-end retry proves a
   manifest-only response without fragment replay; and real ARAP CLI runs verify
-  byte-identical proofs at A, B and C, including a dropped proof fragment
-  repaired while A's process is stopped. Offline-origin thumbnail relay,
+  byte-identical complete proofs at A, B and C, while a dropped fragment stays
+  unverified at C. Offline-origin thumbnail relay,
   delayed application page-end recovery and restart/reconvergence of all three
   Chat processes pass. Modem-level ACKMODE behavior and restart, and competing
   image caches still need coverage.

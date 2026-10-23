@@ -17,11 +17,16 @@ import time
 from . import __version__
 from .auth import ARAPAuth, ARAPUnavailable
 from .data2g import Data2G
-from .protocol import (MAX_FRAME, MAX_MESSAGE_BYTES, MAX_PARTS, image_part, image_parts,
-                       message_parts, proof_parts, relay_message_part,
+from .protocol import (MAX_FRAME, MAX_MESSAGE_BYTES, MAX_PARTS,
+                       MAX_SPARSE_SEQUENCE_REQUESTS, image_part, image_parts,
+                       message_parts, relay_message_part,
                        relay_proof_part, pack, unpack)
 from .store import Store
 from .images import make_thumbnail
+from .pixel_cards import (PixelCard, decode_pixel_card_message,
+                          decode_pixel_card_reference, encode_pixel_card_reference,
+                          load_pixel_card, save_received_pixel_card_message,
+                          verify_pixel_card_payload)
 from .mentions import MENTION, format_mention, mention_name
 import hashlib
 from datetime import datetime, timezone
@@ -30,7 +35,10 @@ from datetime import datetime, timezone
 CHANNEL = re.compile(r"^#[A-Za-z0-9_-]{1,31}$")
 NODE_ID = re.compile(r"^[0-9a-f]{32}$")
 SYNC_PAGE_MESSAGES = 8
+SYNC_SPARSE_MESSAGES = MAX_SPARSE_SEQUENCE_REQUESTS
 SYNC_PAGE_REPAIR_LIMIT = 3
+AUTH_CHALLENGE_CHUNK_BYTES = 112
+AUTH_CHALLENGE_MAX_BYTES = 4096
 # A lost broadcast request or page end should recover on a useful chat
 # timescale. Retries are bounded and back off, so this does not become a
 # continuous source of radio traffic.
@@ -119,7 +127,7 @@ class Chat:
         history_message_limit = self._load_sync_setting(
             args, "sync_history_messages", "sync_history_messages", 0, 1_000_000)
         self.sync_history_messages = history_message_limit or None
-        self.sync_history_budget_remaining = self.sync_history_messages
+        self.sync_history_budget_remaining = self._sync_exchange_budget()
         self.sync_history_budget_generation = 0
         saved_unattended = self.store.saved_setting("unattended")
         self.unattended = (True if getattr(args, "unattended", False) else
@@ -138,7 +146,12 @@ class Chat:
         self.auth = ARAPAuth(cli=args.arap_cli, callsign=args.callsign,
                              key=args.arap_key, key_dir=args.arap_key_dir,
                              trust_store=args.arap_trust_store,
-                             passphrase_env=args.arap_passphrase_env)
+                             passphrase_env=args.arap_passphrase_env,
+                             servers=getattr(args, "arap_server", []))
+        if self.auth.servers:
+            self.events.put(("status", "ARAP out-of-band proofs enabled: signing uploads "
+                            "proofs and verification fetches them over the network; only "
+                            "AR1 references are sent over radio"))
         self.auth_executor = ThreadPoolExecutor(max_workers=1,
                                                 thread_name_prefix="kisschat-arap")
         self.image_executor = ThreadPoolExecutor(max_workers=1,
@@ -147,22 +160,26 @@ class Chat:
         self.auth_pending: dict[tuple[str, int], tuple[bytes, str]] = {}
         self.auth_checked: dict[tuple[str, int], tuple[bytes, str]] = {}
         self.signing_jobs: set[tuple[str, int]] = set()
+        self.reference_jobs: set[tuple[str, int]] = set()
         self.signing_retry_after: dict[tuple[str, int], float] = {}
         self.auth_pending_lock = threading.RLock()
         self.auth_reverify_cursor: tuple[str, int] | None = None
+        self.auth_request_dir = os.path.abspath(args.db) + ".auth-requests"
+        self.auth_challenge_store = os.path.join(self.auth_request_dir, "challenges.sqlite3")
+        self.auth_fragment_lock = threading.RLock()
+        self.auth_fragments: dict[tuple[str, str], dict] = {}
+        self.auth_response_cooldown: dict[str, float] = {}
         self.auth_policy_revision = self.auth.verification_revision()
         self.store.refresh_auth_policy(self.auth_policy_revision)
         self.peer_names: dict[str, str] = {}
         self.peer_nicks: dict[str, str] = {}
         self.peer_last_seen: dict[str, float] = {}
-        self.peer_proofs: dict[tuple[str, str], bool] = {}
         self.cq_frames: dict[str, float] = {}
         self.peer_lock = threading.RLock()
         self.pending: dict[tuple[str, str, int], float] = {}
         self.pending_sync_requests: dict[
             tuple[str, str, int], tuple[dict, tuple, float, int]
         ] = {}
-        self.pending_proofs: dict[tuple[str, str, int], float] = {}
         self.completed_sync_windows: dict[tuple[str, int, int], float] = {}
         self.pending_sync_windows: dict[tuple[str, int, int], tuple[str, float]] = {}
         self.served_sync_requests: dict[tuple, float] = {}
@@ -172,7 +189,7 @@ class Chat:
         self.image_claims: dict[tuple[str, str, int, str, str], tuple[str, float]] = {}
         self.image_response_timers: dict[tuple[str, str, int, str, str], threading.Timer] = {}
         self.seen_image_chunks: dict[tuple[str, str, str, int, str, int], tuple[int, float]] = {}
-        # A manual image request authorizes bounded retries for missing chunks.
+        # A manual attachment request authorizes bounded retries for missing chunks.
         # The first request remains explicit; retries never start for an image
         # the operator has not selected.
         self.pending_images: dict[tuple[str, int, str], tuple[int, float, float]] = {}
@@ -224,7 +241,9 @@ class Chat:
                       for peer, callsign in self.peer_names.items()}
             for callsign in self.cq_frames:
                 labels.setdefault(callsign.casefold(), (callsign, callsign))
-            return sorted(labels.values(), key=lambda item: item[0].casefold())
+        for callsign in self.store.authenticated_stations():
+            labels.setdefault(callsign.casefold(), (callsign, callsign))
+        return sorted(labels.values(), key=lambda item: item[0].casefold())
 
     def station_count(self) -> int:
         with self.peer_lock:
@@ -303,7 +322,7 @@ class Chat:
         with self.pending_lock:
             if retry or (not self.pending_sync_requests and
                          not self.pending_sync_windows):
-                self.sync_history_budget_remaining = self.sync_history_messages
+                self.sync_history_budget_remaining = self._sync_exchange_budget()
                 self.sync_history_budget_generation += 1
             if retry:
                 # An explicit user sync is also a retry for pages whose query
@@ -313,11 +332,9 @@ class Chat:
                 self.completed_sync_windows.clear()
                 self.pending_sync_windows.clear()
                 self.sync_repair_attempts.clear()
-            for pending in (self.pending, self.pending_proofs):
-                for key, expiry in list(pending.items()):
-                    if (expiry <= now and not
-                            (pending is self.pending and key in self.pending_sync_requests)):
-                        pending.pop(key, None)
+            for key, expiry in list(self.pending.items()):
+                if (expiry <= now and key not in self.pending_sync_requests):
+                    self.pending.pop(key, None)
         self._forward_pending_receipts()
         # Repair deferred signatures only when history sync is requested or
         # scheduled. Interactive clients otherwise remain quiet on first connect.
@@ -353,12 +370,19 @@ class Chat:
         hours = getattr(self, "sync_history_hours", DEFAULT_SYNC_HISTORY_HOURS)
         return now - hours * 3600
 
+    def _sync_exchange_budget(self) -> int:
+        """Cap one exchange at the number of sequence IDs carried in one query."""
+        configured = (self.sync_history_messages if self.sync_history_messages is not None
+                      else SYNC_SPARSE_MESSAGES)
+        return min(configured, SYNC_SPARSE_MESSAGES)
+
     def _slow_broadcast_mode(self) -> bool:
         """True when the selected Data2G broadcast mode is 500 Hz or narrower."""
         if getattr(self.args, "transport", "broadcast") != "broadcast":
             return False
-        selected = self.data.auto_mode if self.unattended else self.data.manual_mode
-        width = next((width for name, width in self.data.mode_catalog
+        selected = (getattr(self.data, "auto_mode", None) if self.unattended else
+                    getattr(self.data, "manual_mode", None))
+        width = next((width for name, width in getattr(self.data, "mode_catalog", ())
                       if name == selected), None)
         return width is not None and width <= 500
 
@@ -401,6 +425,11 @@ class Chat:
             self.events.put(("status", f"Transmit queue: {exc}"))
             return False
 
+    def _message_sender_id(self) -> str | None:
+        """Identify the transmitting node where the transport has no source field."""
+        return (self.store.node if getattr(self.args, "transport", "broadcast")
+                in {"broadcast", "connected"} else None)
+
     def set_unattended(self, enabled: bool) -> None:
         """Change and persist the live automatic-transmit bandwidth policy."""
         self.data.set_unattended(enabled)
@@ -439,7 +468,7 @@ class Chat:
         if attachment is None:
             return
         # Neighbor caches advertise their metadata in turn. No repeated flood
-        # and no thumbnail bytes are needed to repair an orphaned caption.
+        # and no attachment payload is needed to repair an orphaned caption.
         sent = self.send_record({"t": "a", "o": attachment["origin"],
                                  "s": attachment["seq"], "h": attachment["digest"],
                                  "b": attachment["size"], "w": attachment["width"],
@@ -648,7 +677,9 @@ class Chat:
             for key, _ in due:
                 self.pending_message_relays.pop(key, None)
         for _, (record, ttl, _) in due:
-            self.send_payload(relay_message_part(record, ttl - 1), priority=10)
+            sender = self._message_sender_id() if record.get("from") else None
+            self.send_payload(relay_message_part(record, ttl - 1, sender=sender),
+                              priority=10)
 
     def _queue_end_relay(self, key: tuple, record: dict, ttl: int) -> None:
         # The page-end record is not a receipt. Let delayed fragment relays
@@ -800,14 +831,21 @@ class Chat:
                                  current[1] == route and current[3] == attempt)
             if still_pending:
                 retry_record = dict(record)
-                if (not record.get("r") and not record.get("v") and
-                        self.store.has_history_data(record["o"], int(record.get("a", 0)),
-                                                    int(record.get("b", 0)))):
+                sparse_sequences = record.get("r", []) if "h" not in record else []
+                sparse_has_data = any(
+                    self.store.has_message(record["o"], int(seq))
+                    for seq in sparse_sequences)
+                range_has_data = (not record.get("r") and
+                                  self.store.has_history_data(
+                                      record["o"], int(record.get("a", 0)),
+                                      int(record.get("b", 0))))
+                if (not record.get("v") and (sparse_has_data or range_has_data)):
                     # The peer's previous page may have arrived while only its
                     # addressed end record was lost. Ask for the page manifest
                     # first, then selectively repair any missing fragments.
                     retry_record["j"] = True
-                    retry_record.pop("h", None)
+                    if not sparse_sequences:
+                        retry_record.pop("h", None)
                 retry_record["k"] = attempt
                 self._send_routed_record(retry_record, (*route, attempt))
 
@@ -874,6 +912,7 @@ class Chat:
 
     def publish(self, body: str, image_path: str | None = None, *,
                 thumbnail: tuple[bytes, int, int] | None = None,
+                card_attachment: dict | None = None,
                 channel: str | None = None, nick: str | None = None):
         channel = self.channel if channel is None else channel
         nick = self.nick if nick is None else nick
@@ -882,6 +921,8 @@ class Chat:
             raise ValueError(f"message exceeds {MAX_MESSAGE_BYTES} UTF-8 bytes")
         if not all(char.isprintable() or char in "\t\n" for char in body):
             raise ValueError("message contains terminal control characters")
+        if (image_path is not None or thumbnail is not None) and card_attachment is not None:
+            raise ValueError("a message may contain one image or card attachment")
         image_bytes = None
         if image_path:
             image_bytes, width, height = make_thumbnail(image_path)
@@ -892,18 +933,22 @@ class Chat:
         if not body and image_bytes is None:
             return
         timestamp = int(time.time())
+        insert_options = {"signer": self.args.callsign if self.auth.enabled else ""}
+        if card_attachment is not None:
+            insert_options["card_attachment"] = card_attachment
         message = self.store.insert_local(
             channel, nick, timestamp, body,
             (image_bytes, width, height) if image_bytes is not None else None,
-            signer=self.args.callsign if self.auth.enabled else "")
-        image = message.get("image")
+            **insert_options)
+        attachment = message.get("image") or message.get("attachment")
         seq = int(message["s"])
         self._debug_log("MESSAGE_LOCAL", {"o": self.store.node, "s": seq,
                                           "ts": timestamp})
         self.events.put(("message", message))
         delivery_queued = True
         for frame in message_parts(origin=self.store.node, seq=seq, channel=channel,
-                                   nick=nick, timestamp=timestamp, text=body):
+                                   nick=nick, timestamp=timestamp, text=body,
+                                   sender=self._message_sender_id()):
             try:
                 if hasattr(self.data, "send_operator_initiated"):
                     self.data.send_operator_initiated(frame)
@@ -925,7 +970,7 @@ class Chat:
             if summary:
                 self.send_record({"t": "k", "from": self.store.node,
                                   "h": [list(item) for item in summary]})
-        if image:
+        if attachment and attachment.get("kind", "image") == "image":
             self._send_attachment(message)
         if self.auth.enabled:
             try:
@@ -959,6 +1004,33 @@ class Chat:
         finally:
             self.image_slots.release()
 
+    def queue_card(self, card: str | PixelCard) -> None:
+        """Queue one PixelQSO card as a log reference with a deferred payload."""
+        channel, nick = self.channel, self.nick
+        if not self.image_slots.acquire(blocking=False):
+            self.events.put(("status", "Media preparation is busy; wait for it to finish"))
+            return
+        self.events.put(("status", "Preparing PixelQSO card…"))
+        try:
+            self.image_executor.submit(self._prepare_and_publish_card, card, channel, nick)
+        except RuntimeError as exc:
+            self.image_slots.release()
+            self.events.put(("status", f"PixelQSO card could not be queued: {exc}"))
+
+    def _prepare_and_publish_card(self, card: str | PixelCard,
+                                  channel: str, nick: str) -> None:
+        try:
+            selected = card if isinstance(card, PixelCard) else load_pixel_card(card)
+            body, payload, reference = encode_pixel_card_reference(selected)
+            self.publish(body, channel=channel, nick=nick,
+                         card_attachment={"payload": payload, "width": selected.width,
+                                          "height": selected.height,
+                                          "digest": reference.digest, "metadata": body})
+        except (OSError, ValueError, OverflowError) as exc:
+            self.events.put(("status", f"PixelQSO card could not be sent: {exc}"))
+        finally:
+            self.image_slots.release()
+
     def _on_frame(self, port: int, payload: bytes, reception: dict | None = None):
         if port != self.data.port:
             return
@@ -979,8 +1051,32 @@ class Chat:
             if peer and peer != self.store.node:
                 entries = [(str(origin), int(low), int(high))
                            for origin, low, high in record.get("h", [])]
-                self._handle_inventory_entries(peer, entries, ttl=4,
-                                               probe_proofs=False)
+                self._handle_inventory_entries(peer, entries, ttl=4)
+            return
+        if kind in {"B", "C"}:
+            self._handle_auth_challenge_record(kind, record)
+            return
+        if kind == "A":
+            origin, seq, reference = (record.get("o"), record.get("s"), record.get("r"))
+            if (not isinstance(origin, str) or not NODE_ID.fullmatch(origin) or
+                    type(seq) is not int or seq < 1 or
+                    not isinstance(reference, str) or
+                    not re.fullmatch(r"AR1[A-Z2-7]{16}", reference)):
+                return
+            ttl = int(record.get("ttl", 4))
+            route_key = ("a", origin, seq, reference)
+            if self._route_once(route_key, ttl):
+                self.send_record({"t": "A", "o": origin, "s": seq,
+                                  "r": reference, "ttl": ttl - 1}, priority=10)
+            self.store.set_auth_reference(origin, seq, reference)
+            auth = self.store.auth_for(origin, seq)
+            self.events.put(("auth", {"o": origin, "s": seq,
+                                       "status": auth["status"],
+                                       "signer": auth["signer"],
+                                       "detail": auth["detail"],
+                                       "reference": reference}))
+            if self.store.has_message(origin, seq):
+                self._queue_reference_resolution(origin, seq, reference)
             return
         if kind == "p":
             ttl = int(record.get("ttl", 4))
@@ -1031,16 +1127,26 @@ class Chat:
                 if self.store.note_origin_station(origin, source):
                     self.events.put(("reception", None))
             self._note_sync_progress(record["o"], int(record["s"]))
-            result = self.store.add_fragment(record, reception)
+            fragment_reception = reception or {}
+            sender_id = record.get("from")
+            if (not fragment_reception.get("source") and
+                    isinstance(sender_id, str) and NODE_ID.fullmatch(sender_id)):
+                fragment_reception = {"source": sender_id, "repeated": False}
+            result = self.store.add_fragment(record, fragment_reception)
             if result:
                 message, inserted = result
                 if inserted:
                     self._debug_log("MESSAGE_STORED", {"o": message["o"], "s": message["s"],
                                                        "ts": message["ts"],
-                                                       "reception": reception or {}})
+                                                       "reception": fragment_reception})
                     existing_proof = self.store.proof_for(message["o"], message["s"])
                     if existing_proof:
                         self._verify_stored_proof(message["o"], message["s"], existing_proof)
+                    else:
+                        auth_record = self.store.auth_for(message["o"], message["s"])
+                        if auth_record.get("reference"):
+                            self._queue_reference_resolution(
+                                message["o"], int(message["s"]), auth_record["reference"])
                     mention_targets = self._mentioned_here(message["b"])
                     if message["c"] != self.channel:
                         self.store.mark_unread(message["o"], int(message["s"]), message["c"],
@@ -1051,17 +1157,60 @@ class Chat:
                     self._queue_relay_announcement(message["o"])
                     for target in mention_targets:
                         self._create_receipt(message, target)
+                if message["o"] != self.store.node:
+                    try:
+                        card_reference = decode_pixel_card_reference(message["b"])
+                    except ValueError as exc:
+                        card_reference = None
+                        self._debug_log("INVALID_PIXELQSO_CARD_REFERENCE", str(exc))
+                    else:
+                        if card_reference is not None:
+                            before = self.store.attachment_for(message["o"], int(message["s"]))
+                            valid = self.store.set_attachment(
+                                message["o"], int(message["s"]), card_reference.digest,
+                                card_reference.size, card_reference.width,
+                                card_reference.height, kind="card", metadata=message["b"])
+                            if not valid:
+                                self._debug_log("CARD_REFERENCE_ATTACHMENT_MISMATCH",
+                                                {"o": message["o"], "s": message["s"]})
+                            elif before is None and not inserted:
+                                self.events.put(("attachment", {"o": message["o"],
+                                                                  "s": message["s"]}))
+                            cached_card = self.store.attachment_blob_for(card_reference.digest)
+                            if valid and cached_card is not None:
+                                self._save_received_card_bytes(
+                                    cached_card, card_reference, message["o"],
+                                    int(message["s"]))
+                        else:
+                            try:
+                                received_card = decode_pixel_card_message(message["b"])
+                            except ValueError as exc:
+                                self._debug_log("INVALID_PIXELQSO_CARD", str(exc))
+                            else:
+                                if received_card is not None:
+                                    try:
+                                        save_received_pixel_card_message(
+                                            received_card, origin=message["o"],
+                                            seq=int(message["s"]))
+                                    except (OSError, ValueError) as exc:
+                                        self.events.put(("status", f"Could not save PixelQSO received card: {exc}"))
         elif kind == "a":
             origin, seq = record.get("o", ""), int(record.get("s", 0))
             digest = record.get("h", "")
             recipient = record.get("to", "")
             before = self.store.attachment_for(origin, seq)
-            if self.store.set_attachment(origin, seq, digest, int(record.get("b", 0)),
-                                         int(record.get("w", 0)), int(record.get("hgt", 0))):
+            attachment_kind = record.get("k", "image")
+            if self.store.set_attachment(
+                    origin, seq, digest, int(record.get("b", 0)),
+                    int(record.get("w", 0)), int(record.get("hgt", 0)),
+                    kind=attachment_kind, metadata=record.get("m", "")):
                 rows = self.store.messages_between(origin, seq - 1, seq)
                 if rows and before is None:
-                    rows[0]["image"] = {"digest": digest, "size": int(record["b"]),
-                                         "width": int(record["w"]), "height": int(record["hgt"])}
+                    key = "image" if attachment_kind == "image" else "attachment"
+                    rows[0][key] = {"digest": digest, "size": int(record["b"]),
+                                    "width": int(record["w"]), "height": int(record["hgt"]),
+                                    "kind": attachment_kind,
+                                    "metadata": record.get("m", "")}
                     existing = self.store.proof_for(origin, seq)
                     if existing:
                         self._verify_stored_proof(origin, seq, existing)
@@ -1096,7 +1245,7 @@ class Chat:
                 self._bound_timed_map(self.image_claims, now, MAX_IMAGE_REQUESTS)
             attachment = self.store.attachment_for(origin, seq)
             if attachment and attachment["digest"] == record.get("h"):
-                body = self.store.image_for(attachment["digest"])
+                body = self.store.attachment_blob_for(attachment["digest"])
                 if body:
                     requested = record.get("i")
                     indexes = None
@@ -1174,7 +1323,6 @@ class Chat:
                     nick = name
                 self.peer_nicks[peer] = nick
             entries = record.get("v")
-            signature_indexes = {}
             try:
                 inventory_ttl = int(record.get("ttl", 4))
             except (TypeError, ValueError):
@@ -1196,7 +1344,6 @@ class Chat:
                     if (type(low) is int and type(high) is int and
                             1 <= low <= high <= 0xFFFFFFFF):
                         origins.append((item[0], low, high))
-                        signature_indexes[item[0]] = index
             else:
                 origin = record.get("o", "")
                 if not isinstance(origin, str) or not NODE_ID.fullmatch(origin):
@@ -1206,14 +1353,6 @@ class Chat:
                 if not 1 <= low <= high <= 0xFFFFFFFF:
                     return
                 origins = [(origin, low, high)]
-            for index, (origin, low, high) in enumerate(origins):
-                signature_mask = record.get("sig")
-                if (inventory_ttl == 4 and type(signature_mask) is int and
-                        signature_mask >= 0):
-                    self.peer_proofs[(peer, origin)] = bool(
-                        signature_mask & (1 << signature_indexes.get(origin, index)))
-                    while len(self.peer_proofs) > MAX_ANNOUNCED_ORIGINS:
-                        self.peer_proofs.pop(next(iter(self.peer_proofs)))
             self._handle_inventory_entries(peer, origins, ttl=inventory_ttl)
             # A cache announces its own inventory after storing new data.
             # Flooded copies cannot serve a one-hop broadcast history page.
@@ -1233,8 +1372,10 @@ class Chat:
             repair_sequences = record.get("r", [])
             repair_fragments = record.get("h", [])
             request_attempt = record.get("k", 0)
+            repair_limit = (SYNC_PAGE_MESSAGES if "h" in record
+                            else SYNC_SPARSE_MESSAGES)
             if (not isinstance(repair_sequences, list) or len(repair_sequences) >
-                    SYNC_PAGE_MESSAGES or any(type(seq) is not int or seq <= 0
+                    repair_limit or any(type(seq) is not int or seq <= 0
                                               for seq in repair_sequences) or
                     len(set(repair_sequences)) != len(repair_sequences) or
                     type(request_attempt) is not int or not 0 <= request_attempt <= 31):
@@ -1293,7 +1434,8 @@ class Chat:
                     # The page-end remains addressed to the requester, so
                     # overhearers do not echo the just-heard fragments.
                     frames = message_parts(origin=row["o"], seq=row["s"], channel=row["c"],
-                                           nick=row["n"], timestamp=row["ts"], text=row["b"])
+                                           nick=row["n"], timestamp=row["ts"], text=row["b"],
+                                           sender=self._message_sender_id())
                     if (len(rows) == 1 and len(frames) == 1 and
                             0 <= now_epoch - int(row["ts"]) <= LIVE_MESSAGE_REPAIR_SECONDS):
                         response_priority = 0
@@ -1311,7 +1453,7 @@ class Chat:
                 # repair pages too; a lost metadata frame must not orphan an image.
                 attachment = (None if record.get("j") else
                               self.store.attachment_for(row["o"], row["s"]))
-                if attachment:
+                if attachment and attachment.get("kind", "image") == "image":
                     attachment_record = {"t": "a", "o": attachment["origin"],
                                          "s": attachment["seq"], "h": attachment["digest"],
                                          "b": attachment["size"], "w": attachment["width"],
@@ -1320,9 +1462,10 @@ class Chat:
                         attachment_record,
                         ("a", "", attachment["origin"], attachment["seq"],
                          attachment["digest"]), priority=10)
-                proof = None if record.get("j") else self.store.proof_for(row["o"], row["s"])
-                if proof:
-                    self._send_proof(row["o"], row["s"], proof)
+                auth = self.store.auth_for(row["o"], row["s"])
+                if auth.get("reference"):
+                    self.send_record({"t": "A", "o": row["o"], "s": row["s"],
+                                      "r": auth["reference"], "ttl": 4}, priority=10)
             page_last = (int(record.get("b", after)) if repair_sequences else
                          int(rows[-1]["s"]) if rows else after)
             end_record = {"t": "e", "to": requester, "from": self.store.node,
@@ -1395,9 +1538,11 @@ class Chat:
             for item in candidates:
                 peer, _, after = item
                 page_sequences = record.get("g", [])
+                page_sequence_limit = (SYNC_SPARSE_MESSAGES if record.get("j")
+                                       else SYNC_PAGE_MESSAGES)
                 page_receipt_valid = (
                     "g" in record and isinstance(page_sequences, list) and
-                    len(page_sequences) <= SYNC_PAGE_MESSAGES and
+                    len(page_sequences) <= page_sequence_limit and
                     all(type(seq) is int and after < seq <= last_returned
                         for seq in page_sequences))
                 if not page_receipt_valid:
@@ -1418,14 +1563,15 @@ class Chat:
                             "o": origin, "a": after, "b": last_returned,
                             "d": since, "f": window_start, "u": window_ceiling,
                             "x": bool(record.get("x")), "r": missing,
-                            "h": [[seq, self.store.missing_fragment_mask(origin, seq)]
-                                  for seq in missing],
                             "ttl": 0,
                         }
+                        if len(missing) <= SYNC_PAGE_MESSAGES:
+                            repair_request["h"] = [
+                                [seq, self.store.missing_fragment_mask(origin, seq)]
+                                for seq in missing]
                         repair_route = ("q", self.store.node, peer, origin,
-                                        after, last_returned, False,
-                                        tuple((seq, self.store.missing_fragment_mask(origin, seq))
-                                              for seq in missing))
+                                        after, last_returned, False, False, 0,
+                                        tuple(missing))
                         self._send_sync_request(repair_request, repair_key,
                                                 repair_route)
                         continue
@@ -1435,19 +1581,6 @@ class Chat:
                 if local > after:
                     # A completed history page is now available to other peers.
                     self._queue_relay_announcement(origin)
-                    page_through = last_returned
-                    if local >= page_through:
-                        # Proof frames may have arrived live before or after the
-                        # message page. Request repair only for a message whose
-                        # complete detached proof is still absent locally.
-                        proof_sequences = (page_sequences if page_receipt_valid else
-                                           [int(row["s"]) for row in
-                                            self.store.messages_between(
-                                                origin, after, page_through, limit=100,
-                                                since=since)])
-                        if any(not self.store.proof_for(origin, int(seq))
-                               for seq in proof_sequences):
-                            self._request_proof_page(peer, origin, after, page_through)
                 # New peers page by actual stored rows, skipping arbitrary
                 # sequence gaps. The fallback supports older peers whose end
                 # record only reports a contiguous high-water value.
@@ -1475,18 +1608,39 @@ class Chat:
                     next_after = (last_returned if has_more else
                                   min(through, max(after + SYNC_PAGE_MESSAGES, local)))
                     key = (peer, origin, next_after)
-                    next_through = through if "x" in record else min(
-                        through, next_after + SYNC_PAGE_MESSAGES)
-                    request_record = {"t": "q", "to": peer, "from": self.store.node,
-                                      "o": origin, "a": next_after,
-                                      "b": next_through, "d": since,
-                                      "f": window_start,
-                                      "u": int(record.get("u", through)),
-                                      "ttl": 0}
-                    self._send_sync_request(
-                        request_record, key,
-                        ("q", self.store.node, peer, origin, next_after,
-                         next_through, False, ()))
+                    window_ceiling = int(record.get("u", through))
+                    if page_receipt_valid:
+                        remaining_count = self.store.missing_sequence_count(
+                            origin, next_after, window_ceiling)
+                        if remaining_count:
+                            sequences = self.store.missing_sequences(
+                                origin, next_after, window_ceiling,
+                                limit=SYNC_SPARSE_MESSAGES)
+                            if sequences:
+                                next_through = sequences[-1]
+                                request_record = {
+                                    "t": "q", "to": peer, "from": self.store.node,
+                                    "o": origin, "a": next_after, "b": next_through,
+                                    "d": since, "f": window_start, "u": window_ceiling,
+                                    "x": len(sequences) < remaining_count,
+                                    "r": sequences, "ttl": 0,
+                                }
+                                self._send_sync_request(
+                                    request_record, key,
+                                    ("q", self.store.node, peer, origin, next_after,
+                                     next_through, False, False, 0, tuple(sequences)))
+                    else:
+                        next_through = through if "x" in record else min(
+                            through, next_after + SYNC_PAGE_MESSAGES)
+                        request_record = {"t": "q", "to": peer, "from": self.store.node,
+                                          "o": origin, "a": next_after,
+                                          "b": next_through, "d": since,
+                                          "f": window_start, "u": window_ceiling,
+                                          "ttl": 0}
+                        self._send_sync_request(
+                            request_record, key,
+                            ("q", self.store.node, peer, origin, next_after,
+                             next_through, False, ()))
         elif kind == "w":
             requester = record.get("p", "")
             if requester and requester != self.store.node:
@@ -1535,13 +1689,10 @@ class Chat:
                     self.send_record(record)
 
     def _handle_inventory_entry(self, peer: str, origin: str, low: int,
-                                high: int, *, ttl: int = 4,
-                                probe_proofs: bool = True) -> None:
-        self._handle_inventory_entries(peer, [(origin, low, high)], ttl=ttl,
-                                       probe_proofs=probe_proofs)
+                                high: int, *, ttl: int = 4) -> None:
+        self._handle_inventory_entries(peer, [(origin, low, high)], ttl=ttl)
 
-    def _handle_inventory_entries(self, peer: str, entries, *, ttl: int = 4,
-                                  probe_proofs: bool = True) -> None:
+    def _handle_inventory_entries(self, peer: str, entries, *, ttl: int = 4) -> None:
         if ttl < 4:
             return
         entries = list(entries)
@@ -1564,8 +1715,9 @@ class Chat:
         for index, (origin, low, high) in enumerate(entries):
             after = max(self.store.contiguous(origin), low - 1)
             window = (origin, low - 1, high)
-            if high > after and window not in completed and (origin, low - 1) not in active:
-                candidates.append((index, high - after))
+            missing = self.store.missing_sequence_count(origin, after, high)
+            if missing and window not in completed and (origin, low - 1) not in active:
+                candidates.append((index, missing))
 
         limits = {}
         with self.pending_lock:
@@ -1583,14 +1735,13 @@ class Chat:
 
         for index, (origin, low, high) in enumerate(entries):
             after = max(self.store.contiguous(origin), low - 1)
-            request_limit = limits.get(index, 0 if high > after else None)
+            has_missing = self.store.missing_sequence_count(origin, after, high) > 0
+            request_limit = limits.get(index, 0 if has_missing else None)
             self._handle_inventory_entry_limited(
-                peer, origin, low, high, ttl=ttl, probe_proofs=probe_proofs,
-                request_limit=request_limit)
+                peer, origin, low, high, ttl=ttl, request_limit=request_limit)
 
     def _handle_inventory_entry_limited(self, peer: str, origin: str, low: int,
                                         high: int, *, ttl: int = 4,
-                                        probe_proofs: bool = True,
                                         request_limit: int | None = None) -> None:
         # A forwarded inventory is useful gossip, but its owner may be outside
         # radio range. Ask a station that directly announced a cached copy so
@@ -1617,11 +1768,9 @@ class Chat:
             active_window = any(key[0] == origin and key[1] == window_start
                                 for key in self.pending_sync_windows)
         if already_synced or active_window:
-            if already_synced and probe_proofs:
-                self._request_recent_proofs(peer, origin, low, high)
             return
-        if high > after:
-            requested = high - after
+        missing_count = self.store.missing_sequence_count(origin, after, high)
+        if missing_count:
             request = (peer, origin, after)
             with self.pending_lock:
                 # Only one neighbor should serve a given origin window. This
@@ -1631,12 +1780,20 @@ class Chat:
                        for key in self.pending_sync_windows):
                     return
                 remaining = self.sync_history_budget_remaining
-                amount = requested if remaining is None else min(requested, remaining)
+                amount = missing_count if remaining is None else min(missing_count, remaining)
                 if request_limit is not None:
                     amount = min(amount, request_limit)
                 if amount <= 0:
                     return
-                through = after + amount
+                through = (high if amount == missing_count else
+                           self.store.sequence_at_missing_offset(
+                               origin, after, high, amount))
+                if through is None:
+                    return
+                sequences = self.store.missing_sequences(
+                    origin, after, through, limit=min(amount, SYNC_SPARSE_MESSAGES))
+                if not sequences:
+                    return
                 request_window = (origin, window_start, through)
                 if request_window in self.pending_sync_windows:
                     return
@@ -1645,29 +1802,31 @@ class Chat:
                 budget_generation = self.sync_history_budget_generation
                 self.pending_sync_windows[request_window] = (
                     peer, now + SYNC_WINDOW_RETRY_SECONDS)
+            batch_through = sequences[-1]
             request_record = {"t": "q", "to": peer, "from": self.store.node,
-                              "o": origin, "a": after, "b": through,
+                              "o": origin, "a": after, "b": batch_through,
                               "d": since, "f": window_start, "u": through,
+                              "x": len(sequences) < amount, "r": sequences,
                               "ttl": 0}
             if not self._send_sync_request(
                 request_record, request,
-                ("q", self.store.node, peer, origin, after, through, False, ())):
+                ("q", self.store.node, peer, origin, after, batch_through,
+                 False, False, 0, tuple(sequences))):
                 with self.pending_lock:
                     if self.pending_sync_windows.get(request_window, (None,))[0] == peer:
                         self.pending_sync_windows.pop(request_window, None)
                     if (self.sync_history_budget_generation == budget_generation and
                             self.sync_history_budget_remaining is not None):
                         self.sync_history_budget_remaining = min(
-                            self.sync_history_messages or 0,
+                            self._sync_exchange_budget(),
                             self.sync_history_budget_remaining + amount)
         elif local_recent > high:
             # Tell the mesh this station can serve history the advertising
             # peer lacks; do not wait for the next periodic inventory round.
             self._queue_relay_announcement(origin)
-        elif local_recent and probe_proofs:
-            # Message history may already match while lossy radio dropped
-            # detached ARAP proof frames. Repair a bounded recent proof page.
-            self._request_recent_proofs(peer, origin, low, high)
+        # A missing detached proof leaves this message unchecked. We do not
+        # request proof-only pages automatically; complete proofs received
+        # with message history are still verified normally.
 
     def command(self, line: str):
         parts = line.strip().split(maxsplit=1)
@@ -1692,19 +1851,24 @@ class Chat:
                 self.events.put(("status", f"Nick is now {self.nick}"))
         elif command == "/history":
             self.events.put(("status", "Use /history in the chat interface to show recent messages"))
+        elif command == "/auth":
+            if not argument or len(argument.split()) != 1:
+                self.events.put(("status", "Usage: /auth CALLSIGN"))
+            else:
+                try:
+                    self.auth_executor.submit(self._issue_auth_challenge, argument)
+                except RuntimeError:
+                    self.events.put(("status", "ARAP is busy; try /auth again shortly"))
         elif command == "/channels":
             names = sorted(set(self.store.channels()) | {self.channel})
             self.events.put(("status", "Channels: " + " ".join(names)))
         elif command == "/sync":
-            # Make an explicit sync a user-controlled retry for pages and
-            # detached signatures whose previous request or response was lost.
-            with self.pending_lock:
-                self.pending_proofs.clear()
+            # Make an explicit sync a user-controlled retry for history pages.
             self.sync(retry=True)
             if self.args.transport == "connected" and not self.data.session_event.is_set():
                 self.events.put(("status", "Connect to a station before syncing history"))
             else:
-                self.events.put(("status", "History and signature sync requested"))
+                self.events.put(("status", "History sync requested"))
         elif command == "/connect":
             if not argument:
                 self.events.put(("status", "Usage: /connect CALLSIGN"))
@@ -1733,9 +1897,9 @@ class Chat:
             except ValueError:
                 attachment = None
             if not attachment:
-                self.events.put(("status", "Use /image-get origin-prefix:sequence for a shown thumbnail"))
-            elif self.store.image_for(attachment["digest"]):
-                self.events.put(("status", "Image already downloaded"))
+                self.events.put(("status", "Use /image-get origin-prefix:sequence for a shown attachment"))
+            elif self.store.attachment_blob_for(attachment["digest"]):
+                self.events.put(("status", "Attachment already downloaded"))
             else:
                 self._request_thumbnail(attachment, attempt=0)
         elif command == "/image":
@@ -1749,7 +1913,7 @@ class Chat:
             else:
                 self.queue_image(image_args[0], " ".join(image_args[1:]))
         elif command == "/help":
-            self.events.put(("status", "/join #channel  /nick name  /cq  /connect CALLSIGN  /disconnect  "
+            self.events.put(("status", "/join #channel  /nick name  /auth CALLSIGN  /cq  /connect CALLSIGN  /disconnect  "
                              "/search TEXT  /images  "
                              "/image PATH [caption]  "
                              "/image-get origin-prefix:sequence  /history [n]  /channels  /sync  "
@@ -1765,7 +1929,7 @@ class Chat:
         self.last_purge_queued_frames = self.data.discard_queued_transmissions()
         with self.pending_lock:
             for cache in (self.pending, self.pending_sync_requests,
-                          self.pending_proofs, self.completed_sync_windows,
+                          self.completed_sync_windows,
                           self.pending_sync_windows, self.served_sync_requests,
                           self.sync_repair_attempts):
                 cache.clear()
@@ -1773,6 +1937,7 @@ class Chat:
             self.auth_pending.clear()
             self.auth_checked.clear()
             self.signing_jobs.clear()
+            self.reference_jobs.clear()
             self.signing_retry_after.clear()
         return self.store.clear_local_history()
 
@@ -1788,45 +1953,235 @@ class Chat:
                 seen.add(folded)
         return mentions
 
-    def _request_recent_proofs(self, peer: str, origin: str, low: int,
-                               through: int) -> None:
-        after = max(low - 1, through - 20)
-        self._request_proof_page(peer, origin, after, through)
+    def _send_auth_reference(self, origin: str, seq: int, reference: str) -> None:
+        self.store.set_auth_reference(origin, seq, reference)
+        auth = self.store.auth_for(origin, seq)
+        self.events.put(("auth", {"o": origin, "s": int(seq),
+                                   "status": auth["status"],
+                                   "signer": auth["signer"],
+                                   "detail": auth["detail"],
+                                   "reference": reference}))
+        if self._route_once(("a", origin, int(seq), reference), 4):
+            self.send_record({"t": "A", "o": origin, "s": int(seq),
+                              "r": reference, "ttl": 4}, priority=10)
 
-    def _request_proof_page(self, peer: str, origin: str, after: int, through: int) -> None:
-        if self.peer_proofs.get((peer, origin)) is False:
-            return
-        rows = self.store.messages_between(origin, after, through, limit=20,
-                                          since=self._history_since())
-        if rows and all(self.store.proof_for(origin, int(row["s"])) for row in rows):
-            return
-        key = (peer, origin, after)
+    def _send_auth_challenge(self, kind: str, fields: dict, payload: bytes) -> bool:
+        if not payload or len(payload) > AUTH_CHALLENGE_MAX_BYTES:
+            raise ValueError("ARAP challenge data exceeds the 4096-byte radio limit")
+        chunks = [payload[index:index + AUTH_CHALLENGE_CHUNK_BYTES]
+                  for index in range(0, len(payload), AUTH_CHALLENGE_CHUNK_BYTES)]
+        if len(chunks) > 40:
+            raise ValueError("ARAP challenge requires too many radio fragments")
+        for index, chunk in enumerate(chunks):
+            record = {**fields, "t": kind, "i": index, "z": len(chunks), "b": chunk}
+            if not self.send_record(record, priority=10):
+                return False
+            self._route_once((kind.lower(), fields["id"], index),
+                             int(fields.get("ttl", 4)))
+        return True
+
+    def _accept_auth_challenge_fragment(self, kind: str, record: dict) -> bytes | None:
+        identifier = record.get("id")
+        index, count, chunk = record.get("i"), record.get("z"), record.get("b")
+        if (not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{16}", identifier) or
+                type(index) is not int or type(count) is not int or
+                not 1 <= count <= 40 or not 0 <= index < count or
+                not isinstance(chunk, bytes) or len(chunk) > AUTH_CHALLENGE_CHUNK_BYTES):
+            return None
+        metadata = {key: record.get(key) for key in ("from", "to", "c")}
         now = time.monotonic()
-        with self.pending_lock:
-            if any(pending_origin == origin and pending_after == after and expiry > now
-                   for (_, pending_origin, pending_after), expiry
-                   in self.pending_proofs.items()):
-                return
-            if not self._track_pending(self.pending_proofs, key, now):
-                return
-        request_record = {"t": "q", "to": peer, "from": self.store.node,
-                          "o": origin, "a": after, "b": through,
-                          "d": self._history_since(),
-                          "v": 1, "ttl": 0}
-        sent = self._send_routed_record(
-            request_record, ("q", self.store.node, peer, origin, after, through, True, ()))
-        if not sent:
-            with self.pending_lock:
-                self.pending_proofs.pop(key, None)
+        key = (kind, identifier)
+        with self.auth_fragment_lock:
+            for old_key, transfer in list(self.auth_fragments.items()):
+                if transfer["expires"] <= now:
+                    self.auth_fragments.pop(old_key, None)
+            if key not in self.auth_fragments and len(self.auth_fragments) >= 64:
+                self.auth_fragments.pop(next(iter(self.auth_fragments)))
+            transfer = self.auth_fragments.setdefault(
+                key, {"count": count, "metadata": metadata, "chunks": {},
+                      "expires": now + 600})
+            if transfer["count"] != count or transfer["metadata"] != metadata:
+                self.auth_fragments.pop(key, None)
+                return None
+            existing = transfer["chunks"].get(index)
+            if existing is not None and existing != chunk:
+                self.auth_fragments.pop(key, None)
+                return None
+            transfer["chunks"][index] = chunk
+            if len(transfer["chunks"]) != count:
+                return None
+            payload = b"".join(transfer["chunks"][part] for part in range(count))
+            self.auth_fragments.pop(key, None)
+            return payload if len(payload) <= AUTH_CHALLENGE_MAX_BYTES else None
 
-    def _send_proof(self, origin: str, seq: int, proof: bytes) -> None:
-        for index, frame in enumerate(proof_parts(origin=origin, seq=seq, proof=proof)):
-            self._route_once(("p", origin, seq, index), 4)
+    def _issue_auth_challenge(self, responder: str) -> None:
+        responder = responder.upper()
+        if not re.fullmatch(r"(?=.{3,20}$)(?=.*[A-Z])(?=.*[0-9])[A-Z0-9]+(?:/[A-Z0-9]+)*",
+                            responder):
+            self.events.put(("status", "Usage: /auth CALLSIGN (ARAP callsign format)"))
+            return
+        if not self.auth.enabled:
+            self.events.put(("status", "Configure an ARAP key before requesting authentication"))
+            return
+        temporary = os.path.join(self.auth_request_dir, f"request-{secrets.token_hex(8)}.cbor")
+        try:
+            os.makedirs(self.auth_request_dir, mode=0o700, exist_ok=True)
+            issued = self.auth.issue_challenge(responder, self.auth_challenge_store, temporary)
+            request = open(temporary, "rb").read()
+            full_hash = issued["request_sha256"]
+            if hashlib.sha256(request).hexdigest() != full_hash:
+                raise ValueError("ARAP challenge request hash did not match its bytes")
+            safe_call = responder.replace("/", "-")
+            destination = os.path.join(self.auth_request_dir,
+                                       f"{full_hash}-{safe_call}.cbor")
+            os.replace(temporary, destination)
+            identifier = full_hash[:16]
+            queued = self._send_auth_challenge("B", {"from": self.store.node,
+                                                       "c": self.auth.callsign, "to": responder,
+                                                       "id": identifier, "ttl": 4}, request)
+            if not queued:
+                self.events.put(("status", "ARAP authentication request was only partly queued"))
+                return
+            self.events.put(("status", f"One-time ARAP authentication requested from {responder}"))
+        except Exception as exc:
             try:
-                self.data.send(frame, priority=10)
-            except (OSError, queue.Full, ConnectionError) as exc:
-                self.events.put(("status", f"Could not queue ARAP proof: {exc}"))
-                break
+                os.unlink(temporary)
+            except OSError:
+                pass
+            self.events.put(("status", f"Could not request ARAP authentication: {exc}"))
+
+    def _answer_auth_challenge(self, identifier: str, requester_node: str,
+                               request: bytes) -> None:
+        try:
+            response = self.auth.respond_challenge(request)
+            if not self._send_auth_challenge("C", {"from": self.store.node,
+                                                     "c": self.auth.callsign,
+                                                     "to": requester_node,
+                                                     "id": identifier, "ttl": 4}, response):
+                self.events.put(("status", "ARAP authentication response was only partly queued"))
+                return
+            self.events.put(("status", f"Sent one-time ARAP authentication response to "
+                             f"{requester_node[:8]}"))
+        except Exception as exc:
+            self.events.put(("status", f"Could not answer ARAP authentication request: {exc}"))
+
+    def _verify_auth_challenge(self, identifier: str, responder: str,
+                               response: bytes) -> None:
+        try:
+            candidates = [name for name in os.listdir(self.auth_request_dir)
+                          if name.startswith(identifier) and name.endswith(".cbor")]
+        except OSError:
+            candidates = []
+        if not candidates:
+            self.events.put(("status", "ARAP authentication response has no pending request"))
+            return
+        last_error = "no matching pending challenge"
+        policy_revision = self.auth_policy_revision
+        for name in candidates[:8]:
+            stem = name[:-5]
+            request_path = os.path.join(self.auth_request_dir, name)
+            requested = stem.split("-", 1)[1].replace("-", "/") if "-" in stem else ""
+            if requested.upper() != responder.upper():
+                continue
+            try:
+                self.auth.verify_challenge(request_path, response, responder,
+                                           self.auth_challenge_store)
+                if self.auth.verification_revision() != policy_revision:
+                    raise ValueError("ARAP trust policy changed during challenge verification")
+                now = int(time.time())
+                self.store.record_station_auth(responder, now)
+                self.events.put(("station-auth", {"callsign": responder,
+                                                   "verified_at": now}))
+                try:
+                    os.unlink(request_path)
+                except OSError:
+                    pass
+                return
+            except Exception as exc:
+                last_error = str(exc)
+        self.events.put(("status", f"ARAP authentication from {responder} failed: {last_error}"))
+
+    def _handle_auth_challenge_record(self, kind: str, record: dict) -> None:
+        sender, recipient, callsign = record.get("from"), record.get("to"), record.get("c")
+        identifier = record.get("id")
+        if (not isinstance(sender, str) or not NODE_ID.fullmatch(sender) or
+                not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{16}", identifier) or
+                not isinstance(callsign, str)):
+            return
+        ttl = int(record.get("ttl", 4))
+        index = record.get("i")
+        if type(index) is not int:
+            return
+        route_key = (kind.lower(), identifier, index)
+        if ttl > 0 and (kind == "B" or recipient != self.store.node) and \
+                self._route_once(route_key, ttl):
+            forwarded = dict(record)
+            forwarded["ttl"] = ttl - 1
+            self.send_record(forwarded, priority=10)
+        if kind == "B":
+            if str(recipient).upper() != self.auth.callsign or not self.auth.enabled:
+                return
+            payload = self._accept_auth_challenge_fragment(kind, record)
+            if payload is None:
+                return
+            if hashlib.sha256(payload).hexdigest()[:16] != identifier:
+                return
+            now = time.monotonic()
+            with self.auth_fragment_lock:
+                if self.auth_response_cooldown.get(sender, 0) > now:
+                    return
+                self.auth_response_cooldown[sender] = now + 60
+                if len(self.auth_response_cooldown) > 512:
+                    self.auth_response_cooldown.pop(next(iter(self.auth_response_cooldown)))
+            self.auth_executor.submit(self._answer_auth_challenge,
+                                      identifier, sender, payload)
+        elif kind == "C" and recipient == self.store.node:
+            payload = self._accept_auth_challenge_fragment(kind, record)
+            if payload is None:
+                return
+            self.auth_executor.submit(self._verify_auth_challenge,
+                                      identifier, callsign.upper(), payload)
+
+    def _queue_reference_resolution(self, origin: str, seq: int, reference: str) -> None:
+        key = (origin, int(seq))
+        if self.store.proof_for(*key) is not None:
+            proof = self.store.proof_for(*key)
+            if proof:
+                self._verify_stored_proof(origin, seq, proof)
+            return
+        if not self.auth.servers:
+            self.store.set_auth(origin, seq, None, "unverified", "",
+                                "AR1 reference received; no ARAP resolver configured")
+            return
+        with self.auth_pending_lock:
+            if key in self.reference_jobs or len(self.reference_jobs) >= MAX_PENDING_AUTH_JOBS:
+                return
+            self.reference_jobs.add(key)
+        try:
+            self.auth_executor.submit(self._resolve_auth_reference, origin, seq, reference)
+        except RuntimeError:
+            with self.auth_pending_lock:
+                self.reference_jobs.discard(key)
+
+    def _resolve_auth_reference(self, origin: str, seq: int, reference: str) -> None:
+        key = (origin, int(seq))
+        try:
+            proof = self.auth.resolve(reference)
+            if not self.store.has_message(origin, seq):
+                return
+            self.store.set_auth(origin, seq, proof, "pending")
+            self._verify_stored_proof(origin, seq, proof)
+        except Exception as exc:
+            if self.store.has_message(origin, seq):
+                self.store.set_auth(origin, seq, None, "unverified", "",
+                                    f"AR1 proof lookup failed: {exc}")
+                self.events.put(("auth", {"o": origin, "s": seq,
+                                           "status": "unverified", "signer": "",
+                                           "detail": f"AR1 proof lookup failed: {exc}",
+                                           "reference": reference}))
+        finally:
+            with self.auth_pending_lock:
+                self.reference_jobs.discard(key)
 
     def _create_receipt(self, message: dict, mention: str) -> None:
         received_at = int(time.time())
@@ -1870,12 +2225,36 @@ class Chat:
     def _receive_image_part(self, record: dict) -> None:
         origin, seq, digest = record["o"], int(record["s"]), record["h"]
         key = (origin, seq, digest)
-        if self.store.image_for(digest) is not None:
-            return
-        body = self.store.add_image_fragment(record)
         attachment = self.store.attachment_for(origin, seq)
         if not attachment or attachment["digest"] != digest:
             return
+        cached = self.store.attachment_blob_for(digest)
+        if cached is not None:
+            if attachment.get("kind") == "card":
+                try:
+                    reference = decode_pixel_card_reference(attachment.get("metadata", ""))
+                    if reference is not None:
+                        self._save_received_card_bytes(cached, reference, origin, seq)
+                except ValueError:
+                    pass
+            return
+        kind = attachment.get("kind", "image")
+        validator = None
+        reference = None
+        if kind == "card":
+            try:
+                reference = decode_pixel_card_reference(attachment.get("metadata", ""))
+            except ValueError:
+                return
+            if (reference is None or reference.digest != digest or
+                    reference.size != int(attachment["size"])):
+                return
+
+            def validator(payload: bytes) -> bool:
+                verify_pixel_card_payload(payload, reference)
+                return True
+
+        body = self.store.add_attachment_fragment(record, kind=kind, validator=validator)
         count = (int(attachment["size"]) + 138) // 139
         missing = self.store.missing_image_indices(origin, seq, count) if body is None else []
         if body is None and int(record["i"]) in missing:
@@ -1898,7 +2277,11 @@ class Chat:
                                                 expires)
                     advance = not window
         if body is not None:
-            self.events.put(("image", identity))
+            if kind == "card" and reference is not None:
+                self._save_received_card_bytes(body, reference, origin, seq)
+                self.events.put(("attachment", identity))
+            else:
+                self.events.put(("image", identity))
         elif advance:
             self._request_thumbnail(attachment, attempt=0, continuing=True)
 
@@ -1908,12 +2291,20 @@ class Chat:
 
     def _request_thumbnail(self, attachment: dict, *, attempt: int,
                            continuing: bool = False) -> int:
-        """Request one small window; received chunks acknowledge its progress."""
+        """Request one small attachment window; chunks acknowledge progress."""
         origin, seq, digest = (attachment["origin"], int(attachment["seq"]),
                                attachment["digest"])
         count = (int(attachment["size"]) + 138) // 139
         missing = self.store.missing_image_indices(origin, seq, count)
-        if not missing or self.store.image_for(digest) is not None:
+        cached = self.store.attachment_blob_for(digest)
+        if not missing or cached is not None:
+            if cached is not None and attachment.get("kind") == "card":
+                try:
+                    reference = decode_pixel_card_reference(attachment.get("metadata", ""))
+                    if reference is not None:
+                        self._save_received_card_bytes(cached, reference, origin, seq)
+                except ValueError:
+                    pass
             return 0
         # Give new chat inventories a turn before asking the sender for the
         # next burst. Polling while that burst arrives causes hidden-terminal
@@ -1925,7 +2316,7 @@ class Chat:
             self._bound_timed_map(self.seen_image_requests, now, MAX_IMAGE_REQUESTS)
             if (attempt == 0 and key not in self.pending_images and
                     len(self.pending_images) >= MAX_PENDING_IMAGES):
-                self.events.put(("status", "Too many thumbnail requests are already pending"))
+                self.events.put(("status", "Too many attachment requests are already pending"))
                 return 0
             previous = self.pending_images.get(key)
             if continuing and previous is None:
@@ -1963,11 +2354,22 @@ class Chat:
             with self.image_lock:
                 self.pending_images[key] = (attempt, now + 30, expires)
         if attempt == 0 and not continuing:
+            attachment_label = "PixelQSO card" if attachment.get("kind") == "card" else "Image"
             if queued:
-                self.events.put(("status", "Image requested from nearby stations"))
+                self.events.put(("status", f"{attachment_label} requested from nearby stations"))
             else:
-                self.events.put(("status", "Image request could not be queued; try again"))
+                self.events.put(("status", f"{attachment_label} request could not be queued; try again"))
         return queued
+
+    def _save_received_card_bytes(self, payload: bytes, reference, origin: str,
+                                  seq: int) -> bool:
+        try:
+            received_card = verify_pixel_card_payload(payload, reference)
+            save_received_pixel_card_message(received_card, origin=origin, seq=seq)
+        except (OSError, ValueError) as exc:
+            self.events.put(("status", f"Could not save PixelQSO received card: {exc}"))
+            return False
+        return True
 
     def _retry_pending_images(self) -> None:
         now = time.monotonic()
@@ -1986,18 +2388,19 @@ class Chat:
                 if attempt >= 3 or expires <= now:
                     self.pending_images.pop((origin, seq, digest), None)
                     self.image_windows.pop((origin, seq, digest), None)
-                    self.events.put(("status", f"Thumbnail {origin[:8]}:{seq} still incomplete; "
+                    self.events.put(("status", f"Attachment {origin[:8]}:{seq} still incomplete; "
                                     "select it to request again"))
                     continue
             attachment = self.store.attachment_for(origin, seq)
-            if not attachment or attachment["digest"] != digest or self.store.image_for(digest):
+            if (not attachment or attachment["digest"] != digest or
+                    self.store.attachment_blob_for(digest)):
                 with self.image_lock:
                     self.pending_images.pop((origin, seq, digest), None)
                     self.image_windows.pop((origin, seq, digest), None)
                 continue
             queued = self._request_thumbnail(attachment, attempt=attempt + 1)
             if queued:
-                self.events.put(("status", f"Retrying thumbnail {origin[:8]}:{seq}; "
+                self.events.put(("status", f"Retrying attachment {origin[:8]}:{seq}; "
                                 "requesting missing fragments"))
             else:
                 with self.image_lock:
@@ -2171,7 +2574,16 @@ class Chat:
             proof = self.auth.sign(message)
             self.store.set_auth(message["o"], message["s"], proof,
                                 "pending", self.args.callsign)
-            self._send_proof(message["o"], message["s"], proof)
+            if self.auth.servers:
+                try:
+                    reference = self.auth.publish(proof)
+                    self._send_auth_reference(message["o"], message["s"], reference)
+                except Exception as publish_error:
+                    self.events.put(("status", "ARAP signature created, but out-of-band "
+                                    f"publication failed: {publish_error}"))
+            else:
+                self.events.put(("status", "ARAP signing is local only; configure an ARAP "
+                                "keyserver to publish proofs out of band"))
             policy_revision = self.auth_policy_revision
             fingerprint = self._auth_fingerprint(message, policy_revision)
             with self.auth_pending_lock:
@@ -2223,7 +2635,9 @@ class Chat:
                     if len(self.auth_checked) > 8192:
                         self.auth_checked.pop(next(iter(self.auth_checked)))
                     self.events.put(("auth", {"o": key[0], "s": key[1], "status": status,
-                                               "signer": signer, "detail": detail}))
+                                              "signer": signer, "detail": detail,
+                                              "reference": self.store.auth_for(*key).get(
+                                                  "reference", "")}))
         finally:
             with self.auth_pending_lock:
                 if self.auth_pending.get(key) == (proof, fingerprint):
@@ -2245,7 +2659,10 @@ class Chat:
                                   else f"… {label}")
                 line += "  [" + ", ".join(states) + "]"
         auth = self.store.auth_for(message["o"], message["s"])
-        if auth["status"] == "pending" and auth["proof"] is not None:
+        if auth["status"] == "pending" and auth["proof"] is None:
+            line += ("  ◌ Resolving ARAP proof" if auth.get("reference")
+                     else "  ◌ Signing with ARAP")
+        elif auth["status"] == "pending" and auth["proof"] is not None:
             signer_label = f" · {auth['signer']}" if auth["signer"] else ""
             line += f"  ◌ Checking signature{signer_label}"
         elif auth["status"] == "verified":
@@ -2322,16 +2739,23 @@ def main():
     parser.add_argument("--sync-history-hours", type=int,
                         help=f"maximum age of history to advertise/request/serve (1-{MAX_SYNC_HISTORY_HOURS} hours; default 48; saved in the database)")
     parser.add_argument("--sync-history-messages", type=int,
-                        help="maximum sequence slots requested across all origins per sync exchange (0 means unlimited; saved in the database)")
+                        help=f"maximum messages requested across all origins per sync exchange (default 36; hard cap {SYNC_SPARSE_MESSAGES}; 0 uses cap; saved in the database)")
     parser.add_argument("--debug-log", default="",
                         help="append timestamped transport and protocol events to this file")
     parser.add_argument("--arap-cli", default=os.getenv("ARAP_CLI", "arap"),
                         help="ARAP executable used for message signatures")
     parser.add_argument("--arap-key", default=os.getenv("KISSCHAT_ARAP_KEY", ""),
-                        help="ARAP Ed25519 private key; signing stays disabled if omitted")
+                        help="ARAP Ed25519 private key; signing stays disabled if omitted; "
+                             "proofs publish out of band when --arap-server is configured")
+    parser.add_argument("--arap-server", action="append",
+                        default=[value.strip() for value in re.split(
+                            r"[;,]", os.getenv("KISSCHAT_ARAP_SERVERS", "")) if value.strip()],
+                        help="ARAP keyserver URL (repeat for resolvers); signing uploads proofs "
+                             "and verification fetches proofs out of band, while only AR1 goes over radio")
     parser.add_argument("--arap-key-dir", default=os.getenv(
         "KISSCHAT_ARAP_KEY_DIR", os.path.expanduser("~/.config/kisschat/keys")),
-        help="directory containing CALLSIGN.pub.pem trusted-key candidates")
+        help="directory containing CALLSIGN.pub.pem trusted-key candidates; missing proofs are "
+             "fetched from configured ARAP servers over the network")
     parser.add_argument("--arap-trust-store", default=os.getenv(
         "KISSCHAT_ARAP_TRUST_STORE", os.path.expanduser("~/.config/arap/trust.json")),
         help="local ARAP trust store used for verified status")
@@ -2386,4 +2810,3 @@ def main():
         pass
     finally:
         chat.close()
-
